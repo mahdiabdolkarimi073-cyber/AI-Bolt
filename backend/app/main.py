@@ -16,6 +16,7 @@ from app.config import settings
 from app.db import connect, run_migrations
 from app.routes import register_routes
 from app.workspace_routes import router as workspace_router
+from app.agent_routes import router as agent_router
 
 
 @asynccontextmanager
@@ -45,6 +46,7 @@ app.add_middleware(
 
 register_routes(app)
 app.include_router(workspace_router)
+app.include_router(agent_router)
 
 
 @app.get("/health", tags=["system"])

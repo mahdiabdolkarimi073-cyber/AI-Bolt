@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { PanelRightClose, Sparkles, MoreHorizontal, Trash2 } from 'lucide-react';
+import { PanelRightClose, Sparkles, MoreHorizontal, Trash2, AlertCircle, X } from 'lucide-react';
 import { ChatMessage } from './ChatMessage';
 import { ChatComposer } from './ChatComposer';
 import type { ChatMessage as ChatMessageType, Provider } from '@/types';
@@ -11,9 +11,14 @@ interface Props {
   onStop: () => void;
   onCollapse: () => void;
   activeProvider: Provider;
+  /** Map of message id -> simulated flag (assistant messages from the dev provider). */
+  simulatedIds?: Set<string>;
+  /** Last error message to surface, if any. */
+  error?: string | null;
+  onDismissError?: () => void;
 }
 
-export function AIChatPanel({ messages, onSend, busy, onStop, onCollapse, activeProvider }: Props) {
+export function AIChatPanel({ messages, onSend, busy, onStop, onCollapse, activeProvider, simulatedIds, error, onDismissError }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -73,10 +78,22 @@ export function AIChatPanel({ messages, onSend, busy, onStop, onCollapse, active
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
         <div className="divide-y divide-surface-800">
           {messages.map((m) => (
-            <ChatMessage key={m.id} message={m} />
+            <ChatMessage key={m.id} message={m} simulated={simulatedIds?.has(m.id)} />
           ))}
         </div>
       </div>
+
+      {error && (
+        <div className="mx-2.5 mb-2 flex items-start gap-2 rounded-lg border border-error-500/40 bg-error-500/10 p-2.5 text-2xs text-error-300 animate-fade-in">
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span className="flex-1 leading-relaxed">{error}</span>
+          {onDismissError && (
+            <button onClick={onDismissError} className="shrink-0 rounded p-0.5 text-error-300 hover:bg-error-500/20" aria-label="Dismiss error">
+              <X size={12} />
+            </button>
+          )}
+        </div>
+      )}
 
       {/* composer */}
       <ChatComposer onSend={onSend} busy={busy} onStop={onStop} />

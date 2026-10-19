@@ -1,11 +1,12 @@
-import { Bot, User, Check, Loader2, Circle } from 'lucide-react';
+import { Bot, User, Check, Loader2, Circle, FlaskConical } from 'lucide-react';
 import type { ChatMessage as ChatMessageType } from '@/types';
 
 interface Props {
   message: ChatMessageType;
+  simulated?: boolean;
 }
 
-export function ChatMessage({ message }: Props) {
+export function ChatMessage({ message, simulated }: Props) {
   const isUser = message.role === 'user';
 
   return (
@@ -24,6 +25,11 @@ export function ChatMessage({ message }: Props) {
           <span className="text-2xs font-semibold text-gray-200">
             {isUser ? 'You' : 'Assistant'}
           </span>
+          {!isUser && simulated && (
+            <span className="inline-flex items-center gap-1 rounded border border-warning-500/40 bg-warning-500/10 px-1.5 py-0.5 text-2xs font-medium text-warning-400" title="This response came from the development simulation provider, not a real AI model.">
+              <FlaskConical size={9} /> Simulated
+            </span>
+          )}
         </div>
         <p className="mt-1 whitespace-pre-wrap text-xs leading-relaxed text-surface-300">
           {message.content}

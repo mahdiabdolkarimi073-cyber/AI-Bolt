@@ -8,11 +8,12 @@ import { BottomPanel } from './BottomPanel';
 import { SettingsDialog } from './SettingsDialog';
 import { ProjectDialog } from './ProjectDialog';
 import { useSettings } from '@/hooks/useSettings';
+import { useAgentChat } from '@/hooks/useAgentChat';
 import { config } from '@/config';
+import { getRepositories } from '@/services/index';
 import {
   providers as allProviders,
   initialTabs,
-  initialChat,
   sampleFileContents,
 } from '@/data/mock';
 import type {
@@ -37,7 +38,6 @@ export function AppShell() {
   );
   const activeProviderObj = allProviders.find((p) => p.id === activeProvider)!;
 
-  // Restore the active provider once settings have loaded.
   useEffect(() => {
     if (persistedSettings) {
       setActiveProvider(persistedSettings.activeProvider);
@@ -56,8 +56,51 @@ export function AppShell() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   const [chatCollapsed, setChatCollapsed] = useState(false);
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(initialChat);
-  const [chatBusy, setChatBusy] = useState(false);
+
+  // Conversation id: lazily created on first send so the Agent has a stable
+  // persistence target. Held in state so the hook re-initializes when set.
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const conversationIdRef = useCallback((id: string) => setConversationId(id), []);
+
+  const agent = useAgentChat({
+    conversationId,
+    providerId: activeProvider,
+    model: activeProviderObj.model,
+    allowSimulation: true,
+  });
+
+  const [simulatedIds, setSimulatedIds] = useState<Set<string>>(new Set());
+
+  const handleSend = useCallback(
+    async (text: string) => {
+      // Ensure a conversation exists, then send immediately with the resolved
+      // id as an override so the first message works before the hook re-renders.
+      let cid = conversationId;
+      if (!cid) {
+        const repos = getRepositories();
+        const conv = await repos.conversations.create({ projectId: null, title: 'New chat' });
+        cid = conv.id;
+        conversationIdRef(conv.id);
+      }
+      const result = await agent.send(text, cid);
+      if (result?.assistantMessage && (result.meta?.simulated || result.assistantMessage.simulated)) {
+        setSimulatedIds((prev) => new Set(prev).add(result.assistantMessage!.id));
+      }
+    },
+    [agent, conversationId, conversationIdRef],
+  );
+
+  const handleStop = useCallback(() => {
+    agent.stop();
+  }, [agent]);
+
+  const chatMessages: ChatMessage[] = agent.messages.map((m) => ({
+    id: m.id,
+    role: m.role === 'system' ? 'assistant' : (m.role as 'user' | 'assistant'),
+    content: m.content,
+    ts: m.createdAt,
+  }));
+  const chatBusy = agent.busy;
 
   const [bottomOpen, setBottomOpen] = useState(true);
   const [bottomTab, setBottomTab] = useState<BottomTab>('terminal');
@@ -78,35 +121,6 @@ export function AppShell() {
     setActiveTabId(initialTabs[0].id);
     setSidebarSection('explorer');
   }, []);
-
-  const handleSend = useCallback((text: string) => {
-    const userMsg: ChatMessage = {
-      id: `u-${Date.now()}`,
-      role: 'user',
-      content: text,
-      ts: Date.now(),
-    };
-    setChatMessages((prev) => [...prev, userMsg]);
-    setChatBusy(true);
-
-    window.setTimeout(() => {
-      const reply: ChatMessage = {
-        id: `a-${Date.now()}`,
-        role: 'assistant',
-        content: 'Got it. In this demo phase I can\'t run real edits yet, but this is where the AI would plan and execute your request step by step.',
-        steps: [
-          { id: 's1', label: 'Analyze request', status: 'done' },
-          { id: 's2', label: 'Plan changes', status: 'done' },
-          { id: 's3', label: 'Apply edits', status: 'pending' },
-        ],
-        ts: Date.now(),
-      };
-      setChatMessages((prev) => [...prev, reply]);
-      setChatBusy(false);
-    }, 1100);
-  }, []);
-
-  const handleStop = useCallback(() => setChatBusy(false), []);
 
   const handleOpenFile = useCallback((node: FileNode) => {
     if (node.type !== 'file') return;
@@ -161,7 +175,6 @@ export function AppShell() {
           onOpenSettings={() => setSettingsOpen(true)}
         />
 
-        {/* Center column: editor + bottom panel */}
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="relative flex min-h-0 flex-1">
             <EditorWorkspace
@@ -175,7 +188,6 @@ export function AppShell() {
               onNewProject={() => setProjectDialog({ open: true, mode: 'new' })}
             />
 
-            {/* Chat panel */}
             {!chatCollapsed ? (
               <div className="w-[380px] shrink-0 xl:w-[420px]">
                 <AIChatPanel
@@ -185,6 +197,9 @@ export function AppShell() {
                   onStop={handleStop}
                   onCollapse={() => setChatCollapsed(true)}
                   activeProvider={activeProviderObj}
+                  simulatedIds={simulatedIds}
+                  error={agent.lastError}
+                  onDismissError={agent.clearError}
                 />
               </div>
             ) : (
@@ -200,7 +215,6 @@ export function AppShell() {
             )}
           </div>
 
-          {/* Sidebar re-expand button (when collapsed) */}
           {sidebarCollapsed && (
             <button
               onClick={() => setSidebarCollapsed(false)}
@@ -221,7 +235,6 @@ export function AppShell() {
         </div>
       </div>
 
-      {/* Dialogs */}
       <SettingsDialog
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
