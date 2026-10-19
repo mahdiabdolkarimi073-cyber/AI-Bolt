@@ -12,8 +12,21 @@ import type {
   MessageRepository,
   ProviderConfigRepository,
   SettingsRepository,
+  MemoryRepository,
+  KnowledgeRepository,
   Repositories,
 } from './repositories';
+import type {
+  Memory,
+  KnowledgeEntry,
+  MemoryCreateInput,
+  MemoryUpdateInput,
+  KnowledgeCreateInput,
+  KnowledgeUpdateInput,
+  MemoryListParams,
+  KnowledgeListParams,
+  ListResult,
+} from '@/types/memory';
 
 /**
  * Backend-backed repositories. These talk to the local FastAPI service.
@@ -182,10 +195,96 @@ class BackendSettingsRepository implements SettingsRepository {
   }
 }
 
+class BackendMemoryRepository implements MemoryRepository {
+  private buildQuery(params: MemoryListParams = {}): string {
+    const qs: string[] = [];
+    if (params.projectId !== undefined) qs.push(`projectId=${encodeURIComponent(params.projectId ?? '')}`);
+    if (params.type) qs.push(`type=${encodeURIComponent(params.type)}`);
+    if (params.search) qs.push(`search=${encodeURIComponent(params.search)}`);
+    if (params.activeOnly !== undefined) qs.push(`activeOnly=${String(params.activeOnly)}`);
+    if (params.limit !== undefined) qs.push(`limit=${String(params.limit)}`);
+    if (params.offset !== undefined) qs.push(`offset=${String(params.offset)}`);
+    return qs.length ? `?${qs.join('&')}` : '';
+  }
+  async list(params: MemoryListParams = {}): Promise<ListResult<Memory>> {
+    const { data, error } = await request<ListResult<Memory>>(`/memory${this.buildQuery(params)}`);
+    if (error) throw new Error(error.message);
+    return data ?? { items: [], total: 0 };
+  }
+  async get(id: string): Promise<Memory | null> {
+    const { data, error } = await request<Memory>(`/memory/${encodeURIComponent(id)}`);
+    if (error) throw new Error(error.message);
+    return data;
+  }
+  async create(input: MemoryCreateInput): Promise<Memory> {
+    const { data, error } = await request<Memory>('/memory', { method: 'POST', body: input });
+    if (error) throw new Error(error.message);
+    if (!data) throw new Error('Empty response from backend');
+    return data;
+  }
+  async update(id: string, patch: MemoryUpdateInput): Promise<Memory> {
+    const { data, error } = await request<Memory>(`/memory/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: patch,
+    });
+    if (error) throw new Error(error.message);
+    if (!data) throw new Error('Empty response from backend');
+    return data;
+  }
+  async remove(id: string): Promise<void> {
+    const { error } = await request<void>(`/memory/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (error) throw new Error(error.message);
+  }
+}
+
+class BackendKnowledgeRepository implements KnowledgeRepository {
+  private buildQuery(params: KnowledgeListParams = {}): string {
+    const qs: string[] = [];
+    if (params.projectId !== undefined) qs.push(`projectId=${encodeURIComponent(params.projectId ?? '')}`);
+    if (params.category) qs.push(`category=${encodeURIComponent(params.category)}`);
+    if (params.search) qs.push(`search=${encodeURIComponent(params.search)}`);
+    if (params.activeOnly !== undefined) qs.push(`activeOnly=${String(params.activeOnly)}`);
+    if (params.limit !== undefined) qs.push(`limit=${String(params.limit)}`);
+    if (params.offset !== undefined) qs.push(`offset=${String(params.offset)}`);
+    return qs.length ? `?${qs.join('&')}` : '';
+  }
+  async list(params: KnowledgeListParams = {}): Promise<ListResult<KnowledgeEntry>> {
+    const { data, error } = await request<ListResult<KnowledgeEntry>>(`/knowledge${this.buildQuery(params)}`);
+    if (error) throw new Error(error.message);
+    return data ?? { items: [], total: 0 };
+  }
+  async get(id: string): Promise<KnowledgeEntry | null> {
+    const { data, error } = await request<KnowledgeEntry>(`/knowledge/${encodeURIComponent(id)}`);
+    if (error) throw new Error(error.message);
+    return data;
+  }
+  async create(input: KnowledgeCreateInput): Promise<KnowledgeEntry> {
+    const { data, error } = await request<KnowledgeEntry>('/knowledge', { method: 'POST', body: input });
+    if (error) throw new Error(error.message);
+    if (!data) throw new Error('Empty response from backend');
+    return data;
+  }
+  async update(id: string, patch: KnowledgeUpdateInput): Promise<KnowledgeEntry> {
+    const { data, error } = await request<KnowledgeEntry>(`/knowledge/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: patch,
+    });
+    if (error) throw new Error(error.message);
+    if (!data) throw new Error('Empty response from backend');
+    return data;
+  }
+  async remove(id: string): Promise<void> {
+    const { error } = await request<void>(`/knowledge/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (error) throw new Error(error.message);
+  }
+}
+
 export const backendRepositories: Repositories = {
   projects: new BackendProjectRepository(),
   conversations: new BackendConversationRepository(),
   messages: new BackendMessageRepository(),
   providers: new BackendProviderConfigRepository(),
   settings: new BackendSettingsRepository(),
+  memories: new BackendMemoryRepository(),
+  knowledge: new BackendKnowledgeRepository(),
 };

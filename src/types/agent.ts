@@ -62,6 +62,10 @@ export interface AgentConfig {
   /** When true, allow the deterministic development provider to answer.
    *  Never silently enabled as a production fallback. */
   allowSimulation?: boolean;
+  /** Phase 7: active project for memory/knowledge retrieval scoping. */
+  projectId?: string | null;
+  /** Phase 7: character budget for retrieved context. 0 disables. */
+  maxRetrievalChars?: number;
 }
 
 /** A validated request entering the Agent runtime. */

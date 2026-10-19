@@ -118,4 +118,102 @@ MIGRATIONS: list[tuple[str, str]] = [
         INSERT OR IGNORE INTO agent_defaults (id) VALUES (1);
         """,
     ),
+    (
+        "0003_memory_knowledge",
+        """
+        -- Persistent conversation memory.
+        -- Stores durable facts, preferences, conventions, and notes learned
+        -- from conversations or entered manually. Distinct from project
+        -- knowledge: a memory is personal/general unless tied to a project.
+        CREATE TABLE IF NOT EXISTS memories (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL CHECK (type IN (
+                'preference','convention','decision','constraint',
+                'instruction','task','fact','note'
+            )),
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            project_id TEXT,
+            tags TEXT NOT NULL DEFAULT '[]',
+            importance INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            last_accessed_at INTEGER,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id);
+        CREATE INDEX IF NOT EXISTS idx_memories_active ON memories(active);
+        CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
+
+        -- Project knowledge base entries.
+        -- Durable project-scoped documentation: summaries, architecture
+        -- decisions, conventions, limitations. Never leaks across projects
+        -- unless project_id is NULL (globally applicable).
+        CREATE TABLE IF NOT EXISTS knowledge_entries (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            category TEXT NOT NULL CHECK (category IN (
+                'summary','architecture','convention','limitation',
+                'documentation','note','other'
+            )),
+            project_id TEXT,
+            tags TEXT NOT NULL DEFAULT '[]',
+            source TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_knowledge_project ON knowledge_entries(project_id);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_active ON knowledge_entries(active);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_category ON knowledge_entries(category);
+
+        -- Full-text search indexes (FTS5). External content tables so the
+        -- canonical rows in memories/knowledge_entries remain the source of
+        -- truth; the FTS indexes are kept in sync via triggers.
+        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+            title, content, tags,
+            content='memories',
+            content_rowid='rowid',
+            tokenize='porter unicode61 remove_diacritics 1'
+        );
+        CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+            INSERT INTO memories_fts(rowid, title, content, tags)
+            VALUES (new.rowid, new.title, new.content, new.tags);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, title, content, tags)
+            VALUES ('delete', old.rowid, old.title, old.content, old.tags);
+        END;
+        CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+            INSERT INTO memories_fts(memories_fts, rowid, title, content, tags)
+            VALUES ('delete', old.rowid, old.title, old.content, old.tags);
+            INSERT INTO memories_fts(rowid, title, content, tags)
+            VALUES (new.rowid, new.title, new.content, new.tags);
+        END;
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+            title, content, tags,
+            content='knowledge_entries',
+            content_rowid='rowid',
+            tokenize='porter unicode61 remove_diacritics 1'
+        );
+        CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON knowledge_entries BEGIN
+            INSERT INTO knowledge_fts(rowid, title, content, tags)
+            VALUES (new.rowid, new.title, new.content, new.tags);
+        END;
+        CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON knowledge_entries BEGIN
+            INSERT INTO knowledge_fts(knowledge_fts, rowid, title, content, tags)
+            VALUES ('delete', old.rowid, old.title, old.content, old.tags);
+        END;
+        CREATE TRIGGER IF NOT EXISTS knowledge_au AFTER UPDATE ON knowledge_entries BEGIN
+            INSERT INTO knowledge_fts(knowledge_fts, rowid, title, content, tags)
+            VALUES ('delete', old.rowid, old.title, old.content, old.tags);
+            INSERT INTO knowledge_fts(rowid, title, content, tags)
+            VALUES (new.rowid, new.title, new.content, new.tags);
+        END;
+        """,
+    ),
 ]

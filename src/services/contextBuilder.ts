@@ -35,6 +35,10 @@ export interface BuildContextOptions {
   maxContextChars?: number;
   /** Max number of history messages to include. 0 = unlimited. */
   maxHistoryMessages?: number;
+  /** Phase 7: pre-rendered retrieved memory/knowledge block, inserted as a
+   *  clearly-labeled reference system message AFTER the real system prompt.
+   *  Never overrides authoritative instructions. */
+  retrievedContext?: string;
 }
 
 const DEFAULT_SYSTEM: AgentSystemPrompt = {
@@ -58,6 +62,7 @@ export function buildContext(opts: BuildContextOptions): BuiltContext {
   const current = opts.currentMessage;
   const maxChars = opts.maxContextChars ?? 0;
   const maxMsgs = opts.maxHistoryMessages ?? 0;
+  const retrieved = opts.retrievedContext ?? '';
   const limitKind: 'token' | 'chars' | 'none' =
     maxChars > 0 ? 'chars' : 'none';
 
@@ -67,9 +72,9 @@ export function buildContext(opts: BuildContextOptions): BuiltContext {
     history = history.slice(history.length - maxMsgs);
   }
 
-  // If no character budget, the context is trivially: [system?] [history] [current].
+  // If no character budget, the context is trivially: [system?] [retrieved?] [history] [current].
   if (maxChars <= 0) {
-    const messages = withSystem(system, [...history, current]);
+    const messages = withContext(system, retrieved, [...history, current]);
     return {
       messages,
       truncated: false,
@@ -78,18 +83,18 @@ export function buildContext(opts: BuildContextOptions): BuiltContext {
     };
   }
 
-  // Reserve budget for system + current; spend the rest on recent history.
+  // Reserve budget for system + retrieved + current; spend the rest on history.
   const systemLen = system.content.length;
+  const retrievedLen = retrieved.length;
   const currentLen = current.content.length;
-  const remaining = Math.max(0, maxChars - systemLen - currentLen);
+  const remaining = Math.max(0, maxChars - systemLen - retrievedLen - currentLen);
 
   let droppedByChars = 0;
   let used = 0;
   const kept: AgentMessage[] = [];
-  // Walk history from newest to oldest, keeping until budget exhausted.
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i];
-    const cost = m.content.length + 1; // +1 for separator/role overhead
+    const cost = m.content.length + 1;
     if (used + cost > remaining) break;
     kept.unshift(m);
     used += cost;
@@ -98,7 +103,7 @@ export function buildContext(opts: BuildContextOptions): BuiltContext {
 
   const truncated = droppedByChars > 0 || opts.history.length > kept.length;
   const droppedHistoryCount = opts.history.length - kept.length;
-  const messages = withSystem(system, [...kept, current]);
+  const messages = withContext(system, retrieved, [...kept, current]);
 
   return {
     messages,
@@ -109,14 +114,14 @@ export function buildContext(opts: BuildContextOptions): BuiltContext {
   };
 }
 
-function withSystem(system: AgentSystemPrompt, rest: AgentMessage[]): AgentMessage[] {
-  const sysMsg: AgentMessage = {
-    id: 'system',
-    role: 'system',
-    content: system.content,
-    createdAt: 0,
-  };
-  return [sysMsg, ...rest];
+function withContext(system: AgentSystemPrompt, retrieved: string, rest: AgentMessage[]): AgentMessage[] {
+  const msgs: AgentMessage[] = [
+    { id: 'system', role: 'system', content: system.content, createdAt: 0 },
+  ];
+  if (retrieved) {
+    msgs.push({ id: 'retrieved', role: 'system', content: retrieved, createdAt: 0 });
+  }
+  return [...msgs, ...rest];
 }
 
 /** Estimate a rough character budget from a desired message count. Used by

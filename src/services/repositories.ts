@@ -1,4 +1,15 @@
 import type { Project, Conversation, ConversationMessage, ProviderConfig, AppSettings } from '@/types/domain';
+import type {
+  Memory,
+  KnowledgeEntry,
+  MemoryCreateInput,
+  MemoryUpdateInput,
+  KnowledgeCreateInput,
+  KnowledgeUpdateInput,
+  MemoryListParams,
+  KnowledgeListParams,
+  ListResult,
+} from '@/types/memory';
 
 /**
  * Persistence contracts. The UI layer programs against these interfaces,
@@ -56,10 +67,28 @@ export interface SettingsRepository {
   update(patch: Partial<AppSettings>): Promise<AppSettings>;
 }
 
+export interface MemoryRepository {
+  list(params?: MemoryListParams): Promise<ListResult<Memory>>;
+  get(id: string): Promise<Memory | null>;
+  create(input: MemoryCreateInput): Promise<Memory>;
+  update(id: string, patch: MemoryUpdateInput): Promise<Memory>;
+  remove(id: string): Promise<void>;
+}
+
+export interface KnowledgeRepository {
+  list(params?: KnowledgeListParams): Promise<ListResult<KnowledgeEntry>>;
+  get(id: string): Promise<KnowledgeEntry | null>;
+  create(input: KnowledgeCreateInput): Promise<KnowledgeEntry>;
+  update(id: string, patch: KnowledgeUpdateInput): Promise<KnowledgeEntry>;
+  remove(id: string): Promise<void>;
+}
+
 export interface Repositories {
   projects: ProjectRepository;
   conversations: ConversationRepository;
   messages: MessageRepository;
   providers: ProviderConfigRepository;
   settings: SettingsRepository;
+  memories: MemoryRepository;
+  knowledge: KnowledgeRepository;
 }

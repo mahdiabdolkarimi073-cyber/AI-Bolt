@@ -27,6 +27,7 @@ from app.repositories import ConversationRepo, MessageRepo
 from app.connection_repos import ConnectionRepo, CredentialRepo, AgentDefaultsRepo
 from app.adapters import resolve_adapter, AdapterError, CATEGORY_OK
 from app.crypto import is_encryption_available
+from app.retrieval import retrieve_context, render_context_block, DEFAULT_RETRIEVAL_BUDGET_CHARS
 
 
 router = APIRouter(prefix="/agent", tags=["agent"])
@@ -44,6 +45,10 @@ class AgentRunRequest(BaseModel):
     allowSimulation: bool = False
     maxContextChars: int = Field(default=24000, ge=0, le=200000)
     maxHistoryMessages: int = Field(default=20, ge=0, le=200)
+    # Phase 7: active project for memory/knowledge retrieval scoping.
+    projectId: Optional[str] = Field(default=None, max_length=120)
+    # Character budget for retrieved memory/knowledge context. 0 disables.
+    maxRetrievalChars: int = Field(default=DEFAULT_RETRIEVAL_BUDGET_CHARS, ge=0, le=20000)
 
 
 class AgentRunResponse(BaseModel):
@@ -54,6 +59,7 @@ class AgentRunResponse(BaseModel):
     assistantMessage: Optional[dict] = None
     error: Optional[dict] = None
     meta: Optional[dict] = None
+    retrieval: Optional[dict] = None
     startedAt: int
     finishedAt: int
 
@@ -100,6 +106,18 @@ def run_agent(body: AgentRunRequest):
 
         # No real connection configured.
         if not connection or not connection["enabled"]:
+            # Even in simulation, retrieve context so the UI can show what would
+            # be injected. Retrieval failure is swallowed.
+            sim_retrieved = []
+            try:
+                sim_retrieved = retrieve_context(
+                    conn,
+                    message=body.message,
+                    project_id=body.projectId,
+                    budget_chars=body.maxRetrievalChars,
+                )
+            except Exception:  # noqa: BLE001
+                sim_retrieved = []
             if body.allowSimulation:
                 content = _simulated_response(body.message)
                 assistant_msg = MessageRepo.append(
@@ -112,6 +130,10 @@ def run_agent(body: AgentRunRequest):
                     userMessage=user_msg,
                     assistantMessage=assistant_msg,
                     meta={"providerId": "dev", "model": body.model or "dev-simulated", "simulated": True, "finishReason": "stop"},
+                    retrieval={
+                        "items": [r.to_dict() for r in sim_retrieved],
+                        "chars": len(render_context_block(sim_retrieved)),
+                    },
                     startedAt=started,
                     finishedAt=int(time.time() * 1000),
                 )
@@ -166,9 +188,31 @@ def run_agent(body: AgentRunRequest):
 
         if body.maxHistoryMessages > 0 and len(prior) > body.maxHistoryMessages:
             prior = prior[-body.maxHistoryMessages:]
+
+        # Phase 7: retrieve relevant memory + knowledge scoped to the active
+        # project (if any). Retrieval failure is swallowed — the run continues
+        # without retrieved context. The block is framed as reference material,
+        # never as instructions that could override the system prompt.
+        retrieved = []
+        retrieval_block = ""
+        try:
+            retrieved = retrieve_context(
+                conn,
+                message=body.message,
+                project_id=body.projectId,
+                budget_chars=body.maxRetrievalChars,
+            )
+            retrieval_block = render_context_block(retrieved)
+        except Exception:  # noqa: BLE001 — retrieval must never fail the run
+            retrieved = []
+            retrieval_block = ""
+
+        # Account for the retrieval block in the character budget so it never
+        # starves history beyond the configured limit.
+        retrieval_len = len(retrieval_block)
         if body.maxContextChars > 0:
             kept = []
-            used = 0
+            used = retrieval_len
             for m in reversed(prior):
                 cost = len(m["content"]) + 1
                 if used + cost > body.maxContextChars:
@@ -181,6 +225,11 @@ def run_agent(body: AgentRunRequest):
         messages: list[dict] = []
         if body.systemPrompt:
             messages.append({"role": "system", "content": body.systemPrompt})
+        # Insert retrieved context as its own system message AFTER the real
+        # system prompt, clearly labeled as reference material. This keeps it
+        # separate from authoritative instructions and from conversation history.
+        if retrieval_block:
+            messages.append({"role": "system", "content": retrieval_block})
         for m in prior:
             messages.append({"role": m["role"], "content": m["content"]})
         messages.append({"role": "user", "content": body.message})
@@ -269,6 +318,10 @@ def run_agent(body: AgentRunRequest):
                 "simulated": False,
                 "finishReason": result.finish_reason,
                 "usage": result.usage,
+            },
+            retrieval={
+                "items": [r.to_dict() for r in retrieved],
+                "chars": retrieval_len,
             },
             startedAt=started,
             finishedAt=int(time.time() * 1000),

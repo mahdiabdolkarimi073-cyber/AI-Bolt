@@ -18,6 +18,7 @@ from app.routes import register_routes
 from app.workspace_routes import router as workspace_router
 from app.agent_routes import router as agent_router
 from app.connection_routes import router as connection_router
+from app.memory_routes import router as memory_router, kb_router as knowledge_router
 
 
 @asynccontextmanager
@@ -49,6 +50,8 @@ register_routes(app)
 app.include_router(workspace_router)
 app.include_router(agent_router)
 app.include_router(connection_router)
+app.include_router(memory_router)
+app.include_router(knowledge_router)
 
 
 @app.get("/health", tags=["system"])
