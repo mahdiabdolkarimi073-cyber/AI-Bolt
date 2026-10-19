@@ -19,6 +19,15 @@ from app.repositories import ProjectRepo
 from app.terminal_routes import router as terminal_router
 
 
+@pytest.fixture(autouse=True)
+def _reset_process_manager():
+    """Clear the module-level process manager before each test so sessions
+    do not leak across tests (it is a singleton in production)."""
+    from app.execution import process_manager
+    process_manager.sessions.clear()
+    yield
+
+
 @pytest.fixture
 def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
     ws = tmp_path / "workspace"

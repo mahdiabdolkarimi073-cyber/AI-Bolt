@@ -478,7 +478,7 @@ def infer_commands(root: Path, runtime: DetectedRuntime) -> list[InferredCommand
 def preview_url_from_output(text: str) -> Optional[str]:
     """Extract a local dev-server URL from process output, if present."""
     import re
-    m = re.search(r"https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|::1)(:\d+)?", text)
+    m = re.search(r"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|::1)(:\d+)?/?", text)
     if not m:
         return None
     url = m.group(0)

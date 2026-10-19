@@ -69,11 +69,10 @@ class TestResolveProjectRoot:
         from app.repositories import ProjectRepo
         (env / "myproj").mkdir()
         with connect() as conn:
-            ProjectRepo.create(conn, name="myproj", path="myproj", template="blank", workspace_path="myproj")
-        root = resolve_project_root("prj-nonexistent-id")
-        # The id won't match — this should raise not_found.
-        with pytest.raises(HTTPException):
-            resolve_project_root("prj-nonexistent-id")
+            project = ProjectRepo.create(conn, name="myproj", path="myproj", template="blank", workspace_path="myproj")
+        # The registered project resolves to its on-disk root.
+        root = resolve_project_root(project["id"])
+        assert root.name == "myproj"
 
     def test_missing_project_raises(self):
         with pytest.raises(HTTPException) as exc:

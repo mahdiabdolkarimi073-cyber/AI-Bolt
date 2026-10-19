@@ -181,16 +181,26 @@ class SessionOutput:
     truncated: bool = False
 
     def append_stdout(self, data: bytes) -> None:
-        if len(self.stdout) < MAX_OUTPUT_BYTES:
-            self.stdout.extend(data)
-        else:
+        if len(self.stdout) >= MAX_OUTPUT_BYTES:
             self.truncated = True
+            return
+        remaining = MAX_OUTPUT_BYTES - len(self.stdout)
+        if len(data) > remaining:
+            self.stdout.extend(data[:remaining])
+            self.truncated = True
+        else:
+            self.stdout.extend(data)
 
     def append_stderr(self, data: bytes) -> None:
-        if len(self.stderr) < MAX_OUTPUT_BYTES:
-            self.stderr.extend(data)
-        else:
+        if len(self.stderr) >= MAX_OUTPUT_BYTES:
             self.truncated = True
+            return
+        remaining = MAX_OUTPUT_BYTES - len(self.stderr)
+        if len(data) > remaining:
+            self.stderr.extend(data[:remaining])
+            self.truncated = True
+        else:
+            self.stderr.extend(data)
 
     def get_text(self) -> dict:
         out = self.stdout.decode("utf-8", errors="replace")
