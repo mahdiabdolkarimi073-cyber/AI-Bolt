@@ -3,6 +3,7 @@ import type { ApiResult } from '@/types/domain';
 import type { ProviderId } from '@/types';
 import type { AgentResult, AgentConfig } from '@/types/agent';
 import { apiErrorToAgentError as toAgentErr } from '@/types/agent';
+import type { RetrievedContextItem, RetrievalMeta } from '@/types/memory';
 
 /**
  * Backend client for the Agent execution endpoint.
@@ -28,6 +29,7 @@ interface AgentRunPayload {
   assistantMessage?: { id: string; conversationId: string; role: string; content: string; createdAt: number };
   error?: { code: string; message: string };
   meta?: { providerId: string; connectionId?: string; model?: string; simulated?: boolean; finishReason?: string; usage?: unknown };
+  retrieval?: { items: RetrievedContextItem[]; chars: number };
   startedAt: number;
   finishedAt: number;
 }
@@ -45,6 +47,8 @@ export async function runAgentViaBackend(input: BackendAgentRunInput): Promise<A
       allowSimulation: input.config.allowSimulation === true,
       maxContextChars: input.config.maxContextChars ?? 24000,
       maxHistoryMessages: input.config.maxHistoryMessages ?? 20,
+      projectId: input.config.projectId ?? null,
+      maxRetrievalChars: input.config.maxRetrievalChars ?? 3500,
     },
     signal: input.signal,
   });
@@ -80,7 +84,12 @@ function toAgentResult(p: AgentRunPayload): AgentResult {
           finishReason: p.meta.finishReason,
         }
       : undefined,
+    retrieval: p.retrieval ? (normalizeRetrieval(p.retrieval) as RetrievalMeta) : undefined,
     startedAt: p.startedAt,
     finishedAt: p.finishedAt,
   };
+}
+
+function normalizeRetrieval(r: { items: RetrievedContextItem[]; chars: number }): RetrievalMeta {
+  return { items: r.items ?? [], chars: r.chars ?? 0 };
 }

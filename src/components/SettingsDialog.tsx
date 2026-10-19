@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Dialog } from './ui/Dialog';
 import { Button } from './ui/Button';
 import { ConnectionsPanel } from './ConnectionsPanel';
+import { MemoryPanel } from './MemoryPanel';
 import type { Provider, ProviderId } from '@/types';
 
 interface Props {
@@ -13,7 +14,7 @@ interface Props {
   onSave: () => void;
 }
 
-const sections = ['General', 'AI Providers', 'AI Connections', 'Editor', 'Appearance', 'Shortcuts'] as const;
+const sections = ['General', 'AI Providers', 'AI Connections', 'Memory', 'Editor', 'Appearance', 'Shortcuts'] as const;
 
 export function SettingsDialog({ open, onClose, providers, activeProvider, onProviderChange, onSave }: Props) {
   const [section, setSection] = useState<(typeof sections)[number]>('AI Connections');
@@ -61,6 +62,8 @@ export function SettingsDialog({ open, onClose, providers, activeProvider, onPro
 
         <div className="min-w-0 flex-1">
           {section === 'AI Connections' && <ConnectionsPanel />}
+
+          {section === 'Memory' && <MemoryPanel />}
 
           {section === 'AI Providers' && (
             <div className="space-y-3">

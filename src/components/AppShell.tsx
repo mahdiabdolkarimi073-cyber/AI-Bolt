@@ -32,6 +32,7 @@ export function AppShell() {
 
   const [projectName, setProjectName] = useState('No project open');
   const [hasProject, setHasProject] = useState(false);
+  const [projectId, setProjectId] = useState<string | null>(null);
 
   const [activeProvider, setActiveProvider] = useState<ProviderId>(
     persistedSettings?.activeProvider ?? config.defaultProvider,
@@ -67,6 +68,7 @@ export function AppShell() {
     providerId: activeProvider,
     model: activeProviderObj.model,
     allowSimulation: true,
+    projectId,
   });
 
   const [simulatedIds, setSimulatedIds] = useState<Set<string>>(new Set());
@@ -78,7 +80,7 @@ export function AppShell() {
       let cid = conversationId;
       if (!cid) {
         const repos = getRepositories();
-        const conv = await repos.conversations.create({ projectId: null, title: 'New chat' });
+        const conv = await repos.conversations.create({ projectId, title: 'New chat' });
         cid = conv.id;
         conversationIdRef(conv.id);
       }
@@ -87,7 +89,7 @@ export function AppShell() {
         setSimulatedIds((prev) => new Set(prev).add(result.assistantMessage!.id));
       }
     },
-    [agent, conversationId, conversationIdRef],
+    [agent, conversationId, conversationIdRef, projectId],
   );
 
   const handleStop = useCallback(() => {
@@ -114,8 +116,23 @@ export function AppShell() {
     mode: 'open',
   });
 
-  const openProject = useCallback((name: string) => {
+  const openProject = useCallback(async (name: string) => {
+    // Persist a project record so retrieval + memory can be scoped to it.
+    let id: string | null = null;
+    try {
+      const repos = getRepositories();
+      const existing = (await repos.projects.list()).find((p) => p.name === name);
+      if (existing) {
+        id = existing.id;
+      } else {
+        const p = await repos.projects.create({ name, path: name, template: 'blank' });
+        id = p.id;
+      }
+    } catch {
+      // Persistence failure is non-fatal; retrieval simply won't be scoped.
+    }
     setProjectName(name);
+    setProjectId(id);
     setHasProject(true);
     setTabs(initialTabs);
     setActiveTabId(initialTabs[0].id);

@@ -25,6 +25,8 @@ export interface UseAgentChatOptions {
   model: string;
   /** Allow the deterministic dev provider to answer when no real provider is ready. */
   allowSimulation?: boolean;
+  /** Phase 7: active project id for memory/knowledge retrieval scoping. */
+  projectId?: string | null;
 }
 
 export interface AgentChatState {
@@ -44,7 +46,7 @@ export interface UseAgentChatReturn extends AgentChatState {
 }
 
 export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
-  const { conversationId, providerId, model, allowSimulation = true } = opts;
+  const { conversationId, providerId, model, allowSimulation = true, projectId = null } = opts;
   const [state, setState] = useState<AgentChatState>({
     messages: [],
     busy: false,
@@ -98,7 +100,7 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
           const { data, error } = await runAgentViaBackend({
             conversationId: cid,
             message: trimmed,
-            config: { providerId, model, allowSimulation },
+            config: { providerId, model, allowSimulation, projectId },
             signal: controller.signal,
           });
           if (error || !data) {
@@ -121,7 +123,7 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
             conversationId: cid,
             message: trimmed,
             requestId,
-            config: { providerId, model, allowSimulation },
+            config: { providerId, model, allowSimulation, projectId },
             signal: controller.signal,
           });
         }
@@ -146,7 +148,7 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
         controllerRef.current = null;
       }
     },
-    [conversationId, providerId, model, allowSimulation, refresh],
+    [conversationId, providerId, model, allowSimulation, projectId, refresh],
   );
 
   const stop = useCallback(() => {

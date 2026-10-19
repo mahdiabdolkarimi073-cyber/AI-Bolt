@@ -8,11 +8,13 @@ import type {
   ProviderExecutionMeta,
   ToolCall,
 } from '@/types/agent';
+import type { RetrievalMeta, RetrievedContextItem } from '@/types/memory';
 import type { AIProvider, ProviderExecuteRequest } from '@/services/providers/aiProvider';
 import { ProviderError } from '@/services/providers/aiProvider';
 import type { Repositories } from './repositories';
 import { buildContext, type BuiltContext } from './contextBuilder';
 import { unsupportedToolResult } from './tools';
+import { retrieveContext, renderContextBlock, DEFAULT_RETRIEVAL_BUDGET_CHARS } from './retrieval';
 
 /**
  * Agent runtime — the orchestration core.
@@ -52,6 +54,8 @@ export interface AgentRuntimeOptions {
   defaultMaxContextChars?: number;
   defaultMaxHistoryMessages?: number;
   defaultTimeoutMs?: number;
+  /** Default character budget for retrieved memory/knowledge context. */
+  defaultMaxRetrievalChars?: number;
 }
 
 interface RunState {
@@ -279,7 +283,28 @@ export class AgentRuntime {
       };
     }
 
-    // 6. Build context.
+    // 5b. Retrieve memory + knowledge scoped to the active project (Phase 7).
+    // Retrieval failure is swallowed — the run continues without retrieved
+    // context. The block is framed as reference material, never as instructions
+    // that could override the system prompt.
+    let retrieval: RetrievalMeta | undefined;
+    let retrievedBlock = '';
+    const retrievalBudget =
+      req.config.maxRetrievalChars ?? this.opts.defaultMaxRetrievalChars ?? DEFAULT_RETRIEVAL_BUDGET_CHARS;
+    if (retrievalBudget > 0) {
+      try {
+        const items = await this.retrieve(req.message, req.config.projectId ?? null, retrievalBudget);
+        if (items.length > 0) {
+          retrievedBlock = renderContextBlock(items);
+          retrieval = { items, chars: retrievedBlock.length };
+        }
+      } catch {
+        // Retrieval must never fail the run.
+      }
+    }
+
+    // 6. Build context (includes the retrieved block as a labeled reference
+    //    system message, accounted for in the character budget).
     const ctx: BuiltContext = buildContext({
       system: req.config.systemPrompt
         ? { content: req.config.systemPrompt, source: 'user' }
@@ -290,6 +315,7 @@ export class AgentRuntime {
       currentMessage: userMessage,
       maxContextChars: req.config.maxContextChars ?? this.opts.defaultMaxContextChars,
       maxHistoryMessages: req.config.maxHistoryMessages ?? this.opts.defaultMaxHistoryMessages,
+      retrievedContext: retrievedBlock,
     });
 
     // 7. Execute through the provider.
@@ -389,8 +415,38 @@ export class AgentRuntime {
       userMessage,
       assistantMessage,
       meta: execResp.meta,
+      retrieval,
       finishedAt: Date.now(),
     };
+  }
+
+  /**
+   * Retrieve memory + knowledge relevant to the user message, scoped to the
+   * active project. Loads both stores via the repository contracts and ranks
+   * them with the shared text-overlap retriever. Retrieval failures are
+   * swallowed by the caller.
+   */
+  private async retrieve(
+    message: string,
+    projectId: string | null,
+    budgetChars: number,
+  ): Promise<RetrievedContextItem[]> {
+    const { repositories } = this.opts;
+    const [memResult, kbResult] = await Promise.all([
+      repositories.memories
+        .list({ projectId: projectId ?? undefined, activeOnly: true, limit: 200 })
+        .catch(() => ({ items: [], total: 0 })),
+      repositories.knowledge
+        .list({ projectId: projectId ?? undefined, activeOnly: true, limit: 200 })
+        .catch(() => ({ items: [], total: 0 })),
+    ]);
+    return retrieveContext({
+      message,
+      projectId,
+      memories: memResult.items,
+      knowledge: kbResult.items,
+      budgetChars,
+    });
   }
 
   private handleProviderError(

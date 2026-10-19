@@ -10,6 +10,7 @@
 
 import type { ProviderId } from '@/types';
 import type { ApiError } from './domain';
+import type { RetrievalMeta } from './memory';
 
 /** Message roles understood by the Agent core. `tool` is reserved for future
  *  tool-call/result support and is accepted by the runtime but not produced in
@@ -143,6 +144,8 @@ export interface AgentResult {
   error?: AgentError;
   /** Provider execution metadata, when a provider actually ran. */
   meta?: ProviderExecutionMeta;
+  /** Phase 7: retrieved memory/knowledge context injected into the run. */
+  retrieval?: RetrievalMeta;
   /** Lifecycle timestamps (ms epoch). */
   startedAt: number;
   finishedAt?: number;

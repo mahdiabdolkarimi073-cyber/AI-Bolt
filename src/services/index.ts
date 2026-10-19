@@ -19,6 +19,11 @@ export function getRepositories(): Repositories {
   return resolved;
 }
 
+/** Test-only: override the active repository set. Pass null to reset. */
+export function setRepositoriesForTesting(repos: Repositories | null): void {
+  current = repos;
+}
+
 /** Test whether the configured backend is reachable. Used by the health check. */
 export async function pingBackend(): Promise<boolean> {
   if (!config.backendEnabled) return false;

@@ -4,6 +4,7 @@ import { StubProvider, stubProviders } from './providers/stubProvider';
 import { DevProvider } from './providers/devProvider';
 import { AgentRuntime, type AgentRuntimeOptions } from './agentRuntime';
 import { getRepositories } from './index';
+import { DEFAULT_RETRIEVAL_BUDGET_CHARS } from './retrieval';
 
 /**
  * Wire the Agent runtime to the existing service layer.
@@ -40,6 +41,7 @@ export function createRuntime(opts?: Partial<AgentRuntimeOptions>): AgentRuntime
     defaultMaxContextChars: opts?.defaultMaxContextChars ?? 24_000,
     defaultMaxHistoryMessages: opts?.defaultMaxHistoryMessages ?? 20,
     defaultTimeoutMs: opts?.defaultTimeoutMs ?? 30_000,
+    defaultMaxRetrievalChars: opts?.defaultMaxRetrievalChars ?? DEFAULT_RETRIEVAL_BUDGET_CHARS,
   });
 }
 
