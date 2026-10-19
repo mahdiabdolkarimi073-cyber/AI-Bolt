@@ -48,13 +48,19 @@ class BackendProjectRepository implements ProjectRepository {
     if (error) throw new Error(error.message);
     return data;
   }
-  async create(input: { name: string; path: string; template: string }): Promise<Project> {
+  async create(input: {
+    name: string;
+    path: string;
+    template: string;
+    workspacePath?: string;
+    importSource?: string;
+  }): Promise<Project> {
     const { data, error } = await request<Project>('/projects', { method: 'POST', body: input });
     if (error) throw new Error(error.message);
     if (!data) throw new Error('Empty response from backend');
     return data;
   }
-  async update(id: string, patch: Partial<Pick<Project, 'name' | 'path'>>): Promise<Project> {
+  async update(id: string, patch: Partial<Pick<Project, 'name' | 'path' | 'workspacePath'>>): Promise<Project> {
     const { data, error } = await request<Project>(`/projects/${encodeURIComponent(id)}`, {
       method: 'PATCH',
       body: patch,

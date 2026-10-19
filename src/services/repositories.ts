@@ -24,8 +24,14 @@ import type {
 export interface ProjectRepository {
   list(): Promise<Project[]>;
   get(id: string): Promise<Project | null>;
-  create(input: { name: string; path: string; template: string }): Promise<Project>;
-  update(id: string, patch: Partial<Pick<Project, 'name' | 'path'>>): Promise<Project>;
+  create(input: {
+    name: string;
+    path: string;
+    template: string;
+    workspacePath?: string;
+    importSource?: string;
+  }): Promise<Project>;
+  update(id: string, patch: Partial<Pick<Project, 'name' | 'path' | 'workspacePath'>>): Promise<Project>;
   remove(id: string): Promise<void>;
 }
 

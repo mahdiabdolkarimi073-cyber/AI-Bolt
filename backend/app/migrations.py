@@ -216,4 +216,27 @@ MIGRATIONS: list[tuple[str, str]] = [
         END;
         """,
     ),
+    (
+        "0004_workspace_projects",
+        """
+        -- Phase 9: on-disk workspace storage for imported projects.
+        -- `workspace_path` is the directory name under WORKSPACE_ROOT where the
+        -- project's files actually live. It is distinct from the legacy `path`
+        -- column (kept for backward compatibility). `import_source` records how
+        -- the project was created ('zip' | 'empty' | 'folder').
+        ALTER TABLE projects ADD COLUMN workspace_path TEXT;
+        ALTER TABLE projects ADD COLUMN import_source TEXT NOT NULL DEFAULT 'manual';
+        ALTER TABLE projects ADD COLUMN last_opened_at INTEGER;
+
+        -- Recent-projects ordering. A project may appear here even after its
+        -- files are removed from disk; the UI distinguishes "registered" from
+        -- "available". Removing a row here does NOT delete on-disk files.
+        CREATE TABLE IF NOT EXISTS recent_projects (
+            project_id TEXT PRIMARY KEY,
+            opened_at INTEGER NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_recent_opened ON recent_projects(opened_at DESC);
+        """,
+    ),
 ]

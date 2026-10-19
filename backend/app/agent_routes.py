@@ -28,6 +28,11 @@ from app.connection_repos import ConnectionRepo, CredentialRepo, AgentDefaultsRe
 from app.adapters import resolve_adapter, AdapterError, CATEGORY_OK
 from app.crypto import is_encryption_available
 from app.retrieval import retrieve_context, render_context_block, DEFAULT_RETRIEVAL_BUDGET_CHARS
+from app.agent_file_tools import (
+    retrieve_project_context,
+    render_project_context_block,
+    DEFAULT_PROJECT_CONTEXT_BUDGET_CHARS,
+)
 
 
 router = APIRouter(prefix="/agent", tags=["agent"])
@@ -49,6 +54,8 @@ class AgentRunRequest(BaseModel):
     projectId: Optional[str] = Field(default=None, max_length=120)
     # Character budget for retrieved memory/knowledge context. 0 disables.
     maxRetrievalChars: int = Field(default=DEFAULT_RETRIEVAL_BUDGET_CHARS, ge=0, le=20000)
+    # Phase 9: character budget for project-file context injection. 0 disables.
+    maxProjectContextChars: int = Field(default=DEFAULT_PROJECT_CONTEXT_BUDGET_CHARS, ge=0, le=20000)
 
 
 class AgentRunResponse(BaseModel):
@@ -60,6 +67,7 @@ class AgentRunResponse(BaseModel):
     error: Optional[dict] = None
     meta: Optional[dict] = None
     retrieval: Optional[dict] = None
+    projectContext: Optional[dict] = None
     startedAt: int
     finishedAt: int
 
@@ -118,6 +126,14 @@ def run_agent(body: AgentRunRequest):
                 )
             except Exception:  # noqa: BLE001
                 sim_retrieved = []
+            # Phase 9: retrieve project-file context (best-effort, swallowed).
+            sim_project_items = []
+            try:
+                sim_project_items = retrieve_project_context(
+                    body.projectId, body.message, body.maxProjectContextChars
+                )
+            except Exception:  # noqa: BLE001
+                sim_project_items = []
             if body.allowSimulation:
                 content = _simulated_response(body.message)
                 assistant_msg = MessageRepo.append(
@@ -133,6 +149,10 @@ def run_agent(body: AgentRunRequest):
                     retrieval={
                         "items": [r.to_dict() for r in sim_retrieved],
                         "chars": len(render_context_block(sim_retrieved)),
+                    },
+                    projectContext={
+                        "items": [i.to_dict() for i in sim_project_items],
+                        "chars": len(render_project_context_block(sim_project_items)),
                     },
                     startedAt=started,
                     finishedAt=int(time.time() * 1000),
@@ -207,12 +227,26 @@ def run_agent(body: AgentRunRequest):
             retrieved = []
             retrieval_block = ""
 
-        # Account for the retrieval block in the character budget so it never
-        # starves history beyond the configured limit.
+        # Phase 9: retrieve project-file context scoped to the active project.
+        # Best-effort — failure is swallowed so the run never fails due to file access.
+        project_items = []
+        project_block = ""
+        try:
+            project_items = retrieve_project_context(
+                body.projectId, body.message, body.maxProjectContextChars
+            )
+            project_block = render_project_context_block(project_items)
+        except Exception:  # noqa: BLE001
+            project_items = []
+            project_block = ""
+
+        # Account for the retrieval + project blocks in the character budget so
+        # they never starve history beyond the configured limit.
         retrieval_len = len(retrieval_block)
+        project_len = len(project_block)
         if body.maxContextChars > 0:
             kept = []
-            used = retrieval_len
+            used = retrieval_len + project_len
             for m in reversed(prior):
                 cost = len(m["content"]) + 1
                 if used + cost > body.maxContextChars:
@@ -230,6 +264,8 @@ def run_agent(body: AgentRunRequest):
         # separate from authoritative instructions and from conversation history.
         if retrieval_block:
             messages.append({"role": "system", "content": retrieval_block})
+        if project_block:
+            messages.append({"role": "system", "content": project_block})
         for m in prior:
             messages.append({"role": m["role"], "content": m["content"]})
         messages.append({"role": "user", "content": body.message})
@@ -322,6 +358,10 @@ def run_agent(body: AgentRunRequest):
             retrieval={
                 "items": [r.to_dict() for r in retrieved],
                 "chars": retrieval_len,
+            },
+            projectContext={
+                "items": [i.to_dict() for i in project_items],
+                "chars": project_len,
             },
             startedAt=started,
             finishedAt=int(time.time() * 1000),

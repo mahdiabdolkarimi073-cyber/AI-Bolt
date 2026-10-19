@@ -11,6 +11,12 @@ export interface Project {
   template: string;
   createdAt: number;
   updatedAt: number;
+  /** Phase 9: on-disk directory name under WORKSPACE_ROOT. */
+  workspacePath?: string | null;
+  /** Phase 9: how the project was created ('zip' | 'empty' | 'folder' | 'manual'). */
+  importSource?: string;
+  /** Phase 9: last-opened timestamp (ms). */
+  lastOpenedAt?: number | null;
 }
 
 /** Persisted chat conversation. */

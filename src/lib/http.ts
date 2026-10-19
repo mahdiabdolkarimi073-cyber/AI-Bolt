@@ -5,6 +5,8 @@ import type { ApiResult } from '@/types/domain';
 interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
+  /** When true, send `body` as-is (e.g. FormData) without JSON-encoding. */
+  raw?: boolean;
   signal?: AbortSignal;
   timeoutMs?: number;
 }
@@ -29,18 +31,24 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
     };
   }
 
-  const { method = 'GET', body, signal, timeoutMs = config.requestTimeoutMs } = opts;
+  const { method = 'GET', body, raw = false, signal, timeoutMs = config.requestTimeoutMs } = opts;
   const url = `${config.apiBaseUrl}${path}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   if (signal) signal.addEventListener('abort', () => controller.abort());
 
+  const isRawBody = raw && body !== undefined;
+  const headers: Record<string, string> | undefined =
+    body !== undefined && !isRawBody ? { 'Content-Type': 'application/json' } : undefined;
+  const sendBody =
+    body !== undefined ? (isRawBody ? (body as BodyInit) : JSON.stringify(body)) : undefined;
+
   try {
     const res = await fetch(url, {
       method,
-      headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      headers,
+      body: sendBody,
       signal: controller.signal,
     });
 

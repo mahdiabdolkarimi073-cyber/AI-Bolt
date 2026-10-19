@@ -83,14 +83,28 @@ class InMemoryProjectRepository implements ProjectRepository {
   async get(id: string): Promise<Project | null> {
     return this.items.find((p) => p.id === id) ?? null;
   }
-  async create(input: { name: string; path: string; template: string }): Promise<Project> {
+  async create(input: {
+    name: string;
+    path: string;
+    template: string;
+    workspacePath?: string;
+    importSource?: string;
+  }): Promise<Project> {
     const now = Date.now();
-    const p: Project = { id: uid('prj'), createdAt: now, updatedAt: now, ...input };
+    const p: Project = {
+      id: uid('prj'),
+      createdAt: now,
+      updatedAt: now,
+      workspacePath: input.workspacePath ?? null,
+      importSource: input.importSource ?? 'manual',
+      lastOpenedAt: null,
+      ...input,
+    };
     this.items = [p, ...this.items];
     this.persist();
     return p;
   }
-  async update(id: string, patch: Partial<Pick<Project, 'name' | 'path'>>): Promise<Project> {
+  async update(id: string, patch: Partial<Pick<Project, 'name' | 'path' | 'workspacePath'>>): Promise<Project> {
     const p = this.items.find((x) => x.id === id);
     if (!p) throw new Error(`Project ${id} not found`);
     Object.assign(p, patch, { updatedAt: Date.now() });

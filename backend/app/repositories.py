@@ -9,6 +9,9 @@ from app.utils import uid, now_ms, dumps, loads
 
 
 def _row_to_project(row: sqlite3.Row) -> dict:
+    # workspace_path / import_source / last_opened_at were added in migration
+    # 0004; guard with keys() so older rows or partial DBs don't break.
+    keys = set(row.keys())
     return {
         "id": row["id"],
         "name": row["name"],
@@ -16,6 +19,9 @@ def _row_to_project(row: sqlite3.Row) -> dict:
         "template": row["template"],
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
+        "workspacePath": row["workspace_path"] if "workspace_path" in keys else None,
+        "importSource": row["import_source"] if "import_source" in keys else "manual",
+        "lastOpenedAt": row["last_opened_at"] if "last_opened_at" in keys else None,
     }
 
 
@@ -62,30 +68,101 @@ class ProjectRepo:
         return _row_to_project(row) if row else None
 
     @staticmethod
-    def create(conn: sqlite3.Connection, *, name: str, path: str, template: str) -> dict:
+    def get_by_workspace_path(conn: sqlite3.Connection, workspace_path: str) -> Optional[dict]:
+        row = query_one(conn, "SELECT * FROM projects WHERE workspace_path = ?", (workspace_path,))
+        return _row_to_project(row) if row else None
+
+    @staticmethod
+    def create(
+        conn: sqlite3.Connection,
+        *,
+        name: str,
+        path: str,
+        template: str,
+        workspace_path: Optional[str] = None,
+        import_source: str = "manual",
+    ) -> dict:
         pid = uid("prj")
         ts = now_ms()
         execute(
             conn,
-            "INSERT INTO projects (id, name, path, template, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-            (pid, name, path, template, ts, ts),
+            """
+            INSERT INTO projects (id, name, path, template, workspace_path, import_source, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (pid, name, path, template, workspace_path, import_source, ts, ts),
         )
-        return {"id": pid, "name": name, "path": path, "template": template, "createdAt": ts, "updatedAt": ts}
+        return {
+            "id": pid,
+            "name": name,
+            "path": path,
+            "template": template,
+            "createdAt": ts,
+            "updatedAt": ts,
+            "workspacePath": workspace_path,
+            "importSource": import_source,
+            "lastOpenedAt": None,
+        }
 
     @staticmethod
-    def update(conn: sqlite3.Connection, pid: str, *, name: Optional[str], path: Optional[str]) -> Optional[dict]:
+    def update(
+        conn: sqlite3.Connection,
+        pid: str,
+        *,
+        name: Optional[str] = None,
+        path: Optional[str] = None,
+        workspace_path: Optional[str] = None,
+    ) -> Optional[dict]:
         row = query_one(conn, "SELECT * FROM projects WHERE id = ?", (pid,))
         if not row:
             return None
         new_name = name if name is not None else row["name"]
         new_path = path if path is not None else row["path"]
+        new_wp = workspace_path if workspace_path is not None else row["workspace_path"]
         ts = now_ms()
-        execute(conn, "UPDATE projects SET name=?, path=?, updated_at=? WHERE id=?", (new_name, new_path, ts, pid))
+        execute(
+            conn,
+            "UPDATE projects SET name=?, path=?, workspace_path=?, updated_at=? WHERE id=?",
+            (new_name, new_path, new_wp, ts, pid),
+        )
         return _row_to_project(query_one(conn, "SELECT * FROM projects WHERE id = ?", (pid,)))
+
+    @staticmethod
+    def touch_opened(conn: sqlite3.Connection, pid: str) -> None:
+        ts = now_ms()
+        execute(conn, "UPDATE projects SET last_opened_at=? WHERE id=?", (ts, pid))
+        execute(
+            conn,
+            "INSERT INTO recent_projects (project_id, opened_at) VALUES (?, ?) "
+            "ON CONFLICT(project_id) DO UPDATE SET opened_at=excluded.opened_at",
+            (pid, ts),
+        )
 
     @staticmethod
     def remove(conn: sqlite3.Connection, pid: str) -> bool:
         cur = execute(conn, "DELETE FROM projects WHERE id = ?", (pid,))
+        return cur.rowcount > 0
+
+
+class RecentProjectsRepo:
+    @staticmethod
+    def list(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+        rows = query_all(
+            conn,
+            """
+            SELECT p.*, r.opened_at as recent_opened_at
+            FROM recent_projects r
+            JOIN projects p ON p.id = r.project_id
+            ORDER BY r.opened_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [_row_to_project(r) for r in rows]
+
+    @staticmethod
+    def remove(conn: sqlite3.Connection, pid: str) -> bool:
+        cur = execute(conn, "DELETE FROM recent_projects WHERE project_id = ?", (pid,))
         return cur.rowcount > 0
 
 

@@ -7,32 +7,45 @@ import { AIChatPanel } from './AIChatPanel';
 import { BottomPanel } from './BottomPanel';
 import { SettingsDialog } from './SettingsDialog';
 import { ProjectDialog } from './ProjectDialog';
+import { PromptDialog } from './PromptDialog';
+import { ConfirmDialog } from './ConfirmDialog';
 import { useSettings } from '@/hooks/useSettings';
 import { useAgentChat } from '@/hooks/useAgentChat';
+import { useWorkspace, type OpenFileTab } from '@/hooks/useWorkspace';
 import { config } from '@/config';
 import { getRepositories } from '@/services/index';
-import {
-  providers as allProviders,
-  initialTabs,
-  sampleFileContents,
-} from '@/data/mock';
+import { workspaceService } from '@/services/workspace';
+import { providers as allProviders } from '@/data/mock';
 import type {
   ProviderId,
   SidebarSection,
   BottomTab,
-  OpenTab,
   ChatMessage,
   FileNode,
 } from '@/types';
+import type { Project } from '@/types/domain';
+
+type PromptState =
+  | { kind: 'none' }
+  | { kind: 'createFile'; parentDir: string }
+  | { kind: 'createDir'; parentDir: string }
+  | { kind: 'rename'; node: FileNode };
+
+type ConfirmState =
+  | { kind: 'none' }
+  | { kind: 'delete'; node: FileNode };
 
 export function AppShell() {
   const { state: settingsState, update: updateSettings } = useSettings();
   const persistedSettings =
     settingsState.kind === 'success' ? settingsState.data : null;
 
-  const [projectName, setProjectName] = useState('No project open');
-  const [hasProject, setHasProject] = useState(false);
-  const [projectId, setProjectId] = useState<string | null>(null);
+  const workspace = useWorkspace();
+
+  const activeProject = workspace.activeProject;
+  const projectName = activeProject?.name ?? 'No project open';
+  const hasProject = activeProject !== null;
+  const projectId = activeProject?.id ?? null;
 
   const [activeProvider, setActiveProvider] = useState<ProviderId>(
     persistedSettings?.activeProvider ?? config.defaultProvider,
@@ -45,6 +58,21 @@ export function AppShell() {
     }
   }, [persistedSettings]);
 
+  // On mount, load projects and optionally reopen the active one.
+  useEffect(() => {
+    (async () => {
+      const list = await workspace.refreshProjects();
+      const activeId = persistedSettings?.activeProjectId;
+      if (activeId) {
+        const target = list.find((p) => p.id === activeId);
+        if (target && target.workspacePath) {
+          await workspace.openProject(target);
+        }
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleProviderChange = useCallback(
     (id: ProviderId) => {
       setActiveProvider(id);
@@ -55,11 +83,8 @@ export function AppShell() {
 
   const [sidebarSection, setSidebarSection] = useState<SidebarSection>('explorer');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-
   const [chatCollapsed, setChatCollapsed] = useState(false);
 
-  // Conversation id: lazily created on first send so the Agent has a stable
-  // persistence target. Held in state so the hook re-initializes when set.
   const [conversationId, setConversationId] = useState<string | null>(null);
   const conversationIdRef = useCallback((id: string) => setConversationId(id), []);
 
@@ -75,8 +100,6 @@ export function AppShell() {
 
   const handleSend = useCallback(
     async (text: string) => {
-      // Ensure a conversation exists, then send immediately with the resolved
-      // id as an override so the first message works before the hook re-renders.
       let cid = conversationId;
       if (!cid) {
         const repos = getRepositories();
@@ -107,67 +130,108 @@ export function AppShell() {
   const [bottomOpen, setBottomOpen] = useState(true);
   const [bottomTab, setBottomTab] = useState<BottomTab>('terminal');
 
-  const [tabs, setTabs] = useState<OpenTab[]>(hasProject ? initialTabs : []);
-  const [activeTabId, setActiveTabId] = useState<string | null>(hasProject ? initialTabs[0]?.id ?? null : null);
-
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [projectDialog, setProjectDialog] = useState<{ open: boolean; mode: 'open' | 'new' }>({
     open: false,
     mode: 'open',
   });
 
-  const openProject = useCallback(async (name: string) => {
-    // Persist a project record so retrieval + memory can be scoped to it.
-    let id: string | null = null;
-    try {
-      const repos = getRepositories();
-      const existing = (await repos.projects.list()).find((p) => p.name === name);
-      if (existing) {
-        id = existing.id;
+  const [promptState, setPromptState] = useState<PromptState>({ kind: 'none' });
+  const [confirmState, setConfirmState] = useState<ConfirmState>({ kind: 'none' });
+
+  // When project changes, reset conversation so a new chat starts for that project.
+  useEffect(() => {
+    setConversationId(null);
+  }, [projectId]);
+
+  const handleProjectOpened = useCallback(
+    async (project: Project) => {
+      await workspace.refreshProjects();
+      await workspace.openProject(project);
+      setSidebarSection('explorer');
+    },
+    [workspace],
+  );
+
+  const handleSwitchProject = useCallback(
+    async (project: Project) => {
+      if (project.workspacePath) {
+        await workspace.openProject(project);
+        updateSettings({ activeProjectId: project.id });
       } else {
-        const p = await repos.projects.create({ name, path: name, template: 'blank' });
-        id = p.id;
+        // Project has no on-disk workspace; can't open files.
+        workspace.clearError();
       }
-    } catch {
-      // Persistence failure is non-fatal; retrieval simply won't be scoped.
-    }
-    setProjectName(name);
-    setProjectId(id);
-    setHasProject(true);
-    setTabs(initialTabs);
-    setActiveTabId(initialTabs[0].id);
-    setSidebarSection('explorer');
+    },
+    [workspace, updateSettings],
+  );
+
+  // --- File operations ---
+
+  const handleCreateFile = useCallback((parentDir: string) => {
+    setPromptState({ kind: 'createFile', parentDir });
   }, []);
 
-  const handleOpenFile = useCallback((node: FileNode) => {
-    if (node.type !== 'file') return;
-    const existing = tabs.find((t) => t.name === node.name);
-    if (existing) {
-      setActiveTabId(existing.id);
-      return;
-    }
-    const newTab: OpenTab = {
-      id: `t-${Date.now()}`,
-      name: node.name,
-      path: `src/${node.name}`,
-      language: node.language ?? 'tsx',
-    };
-    setTabs((prev) => [...prev, newTab]);
-    setActiveTabId(newTab.id);
-  }, [tabs]);
+  const handleCreateDir = useCallback((parentDir: string) => {
+    setPromptState({ kind: 'createDir', parentDir });
+  }, []);
 
-  const handleCloseTab = useCallback(
-    (id: string) => {
-      setTabs((prev) => {
-        const next = prev.filter((t) => t.id !== id);
-        if (activeTabId === id) {
-          setActiveTabId(next[next.length - 1]?.id ?? null);
+  const handleRenameNode = useCallback((node: FileNode) => {
+    setPromptState({ kind: 'rename', node });
+  }, []);
+
+  const handleDeleteNode = useCallback((node: FileNode) => {
+    setConfirmState({ kind: 'delete', node });
+  }, []);
+
+  const handlePromptConfirm = useCallback(
+    async (value: string) => {
+      if (!workspace.activeProject) return;
+      const pid = workspace.activeProject.id;
+      try {
+        if (promptState.kind === 'createFile') {
+          const fullPath = promptState.parentDir ? `${promptState.parentDir}/${value}` : value;
+          await workspaceService.writeFile(pid, fullPath, '', { overwrite: false });
+          await workspace.refreshTree();
+        } else if (promptState.kind === 'createDir') {
+          const fullPath = promptState.parentDir ? `${promptState.parentDir}/${value}` : value;
+          await workspaceService.createDirectory(pid, fullPath);
+          await workspace.refreshTree();
+        } else if (promptState.kind === 'rename') {
+          const node = promptState.node;
+          const parentParts = node.id.split('/').slice(0, -1);
+          const parent = parentParts.join('/');
+          const toPath = parent ? `${parent}/${value}` : value;
+          await workspaceService.renamePath(pid, node.id, toPath);
+          await workspace.refreshTree();
         }
-        return next;
-      });
+      } catch (e) {
+        workspace.setError(e instanceof Error ? e.message : 'Operation failed');
+      }
     },
-    [activeTabId]
+    [promptState, workspace],
   );
+
+  const handleConfirmDelete = useCallback(
+    async () => {
+      if (confirmState.kind !== 'delete' || !workspace.activeProject) return;
+      const node = confirmState.node;
+      try {
+        await workspaceService.deletePath(workspace.activeProject.id, node.id, true);
+        // Close any open tab for this path.
+        const tab = workspace.tabs.find((t) => t.path === node.id);
+        if (tab) {
+          workspace.closeTab(tab.id, true);
+        }
+        await workspace.refreshTree();
+      } catch (e) {
+        workspace.setError(e instanceof Error ? e.message : 'Delete failed');
+      }
+    },
+    [confirmState, workspace],
+  );
+
+  const activeTab = workspace.tabs.find((t) => t.id === workspace.activeTabId) ?? null;
 
   return (
     <div className="flex h-screen min-h-0 flex-col overflow-hidden bg-surface-950 text-gray-200">
@@ -188,19 +252,35 @@ export function AppShell() {
           onChange={setSidebarSection}
           collapsed={sidebarCollapsed}
           onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
-          onOpenFile={handleOpenFile}
+          onOpenFile={workspace.openFile}
           onOpenSettings={() => setSettingsOpen(true)}
+          onNewProject={() => setProjectDialog({ open: true, mode: 'new' })}
+          onOpenProject={() => setProjectDialog({ open: true, mode: 'open' })}
+          projects={workspace.projects}
+          activeProject={workspace.activeProject}
+          onSwitchProject={handleSwitchProject}
+          tree={workspace.tree}
+          treeLoading={workspace.treeLoading}
+          treeError={workspace.treeError}
+          activeFilePath={activeTab?.path ?? null}
+          onRefreshTree={workspace.refreshTree}
+          onCreateFile={handleCreateFile}
+          onCreateDir={handleCreateDir}
+          onRenameNode={handleRenameNode}
+          onDeleteNode={handleDeleteNode}
         />
 
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="relative flex min-h-0 flex-1">
             <EditorWorkspace
-              tabs={tabs}
-              activeTabId={activeTabId}
-              onSelectTab={setActiveTabId}
-              onCloseTab={handleCloseTab}
-              fileContents={sampleFileContents}
+              tabs={workspace.tabs}
+              activeTabId={workspace.activeTabId}
+              onSelectTab={workspace.setActiveTabId}
+              onCloseTab={workspace.closeTab}
+              onChangeContent={workspace.updateTabContent}
+              onSave={workspace.saveTab}
               hasProject={hasProject}
+              busy={workspace.busy}
               onOpenProject={() => setProjectDialog({ open: true, mode: 'open' })}
               onNewProject={() => setProjectDialog({ open: true, mode: 'new' })}
             />
@@ -252,6 +332,18 @@ export function AppShell() {
         </div>
       </div>
 
+      {workspace.error && (
+        <div className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-error-500/30 bg-surface-850 px-4 py-2 text-xs text-error-400 shadow-xl">
+          {workspace.error}
+          <button
+            onClick={workspace.clearError}
+            className="ml-3 text-surface-300 hover:text-gray-100"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       <SettingsDialog
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
@@ -264,10 +356,50 @@ export function AppShell() {
         open={projectDialog.open}
         mode={projectDialog.mode}
         onClose={() => setProjectDialog({ open: false, mode: projectDialog.mode })}
-        onConfirm={(name) => {
-          openProject(name);
-          setProjectDialog({ open: false, mode: projectDialog.mode });
-        }}
+        onProjectOpened={handleProjectOpened}
+        onProjectCreated={handleProjectOpened}
+      />
+
+      <PromptDialog
+        open={promptState.kind === 'createFile'}
+        title="New file"
+        label="File name (path relative to project root)"
+        placeholder="src/main.ts"
+        confirmLabel="Create"
+        onConfirm={handlePromptConfirm}
+        onClose={() => setPromptState({ kind: 'none' })}
+      />
+      <PromptDialog
+        open={promptState.kind === 'createDir'}
+        title="New folder"
+        label="Folder name"
+        placeholder="src/components"
+        confirmLabel="Create"
+        onConfirm={handlePromptConfirm}
+        onClose={() => setPromptState({ kind: 'none' })}
+      />
+      <PromptDialog
+        open={promptState.kind === 'rename'}
+        title="Rename"
+        label="New name"
+        initialValue={promptState.kind === 'rename' ? promptState.node.name : ''}
+        confirmLabel="Rename"
+        onConfirm={handlePromptConfirm}
+        onClose={() => setPromptState({ kind: 'none' })}
+      />
+
+      <ConfirmDialog
+        open={confirmState.kind === 'delete'}
+        title="Delete"
+        message={
+          confirmState.kind === 'delete'
+            ? `Are you sure you want to delete "${confirmState.node.name}"? This cannot be undone.`
+            : ''
+        }
+        confirmLabel="Delete"
+        destructive
+        onConfirm={handleConfirmDelete}
+        onClose={() => setConfirmState({ kind: 'none' })}
       />
     </div>
   );

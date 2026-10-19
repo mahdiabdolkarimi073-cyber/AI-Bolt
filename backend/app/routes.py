@@ -19,11 +19,14 @@ class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     path: str = Field(min_length=1, max_length=512)
     template: str = Field(default="blank", max_length=60)
+    workspacePath: Optional[str] = Field(default=None, max_length=120)
+    importSource: str = Field(default="manual", max_length=60)
 
 
 class ProjectUpdate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=120)
     path: Optional[str] = Field(default=None, max_length=512)
+    workspacePath: Optional[str] = Field(default=None, max_length=120)
 
 
 @router.get("")
@@ -35,7 +38,14 @@ def list_projects():
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_project(body: ProjectCreate):
     with connect() as conn:
-        return ProjectRepo.create(conn, name=body.name, path=body.path, template=body.template)
+        return ProjectRepo.create(
+            conn,
+            name=body.name,
+            path=body.path,
+            template=body.template,
+            workspace_path=body.workspacePath,
+            import_source=body.importSource,
+        )
 
 
 @router.get("/{pid}")
@@ -50,7 +60,7 @@ def get_project(pid: str):
 @router.patch("/{pid}")
 def update_project(pid: str, body: ProjectUpdate):
     with connect() as conn:
-        p = ProjectRepo.update(conn, pid, name=body.name, path=body.path)
+        p = ProjectRepo.update(conn, pid, name=body.name, path=body.path, workspace_path=body.workspacePath)
         if not p:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Project not found")
         return p
