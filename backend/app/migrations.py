@@ -59,4 +59,63 @@ MIGRATIONS: list[tuple[str, str]] = [
         INSERT OR IGNORE INTO settings (id) VALUES (1);
         """,
     ),
+    (
+        "0002_connections",
+        """
+        -- API connections. A connection is a user-defined configuration that
+        -- binds an adapter (protocol) to a base URL and a set of credentials +
+        -- models. Connection identity is separate from provider identity: a
+        -- user may create multiple GroqCloud connections with different keys.
+        CREATE TABLE IF NOT EXISTS api_connections (
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            adapter TEXT NOT NULL CHECK (adapter IN ('openai_compatible','gemini')),
+            provider_label TEXT,
+            base_url TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'untested',
+            default_model TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        -- Models configured for a connection. Manually entered or discovered.
+        CREATE TABLE IF NOT EXISTS connection_models (
+            id TEXT PRIMARY KEY,
+            connection_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            label TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (connection_id) REFERENCES api_connections(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_conn_models_connection ON connection_models(connection_id);
+
+        -- API credentials. The secret is stored encrypted (Fernet). Metadata
+        -- (label, enabled, mask) is stored in plaintext for safe display.
+        CREATE TABLE IF NOT EXISTS connection_credentials (
+            id TEXT PRIMARY KEY,
+            connection_id TEXT NOT NULL,
+            label TEXT,
+            encrypted_secret TEXT NOT NULL,
+            key_mask TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (connection_id) REFERENCES api_connections(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_credentials_connection ON connection_credentials(connection_id);
+
+        -- Default connection + model for new Agent conversations. Single row.
+        CREATE TABLE IF NOT EXISTS agent_defaults (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            connection_id TEXT,
+            model TEXT,
+            FOREIGN KEY (connection_id) REFERENCES api_connections(id) ON DELETE SET NULL
+        );
+        INSERT OR IGNORE INTO agent_defaults (id) VALUES (1);
+        """,
+    ),
 ]

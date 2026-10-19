@@ -1,6 +1,7 @@
 """Application configuration loaded from environment variables."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -20,7 +21,20 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
 
-    # Provider API keys — never exposed to the browser.
+    # Master encryption key for stored API credentials (Fernet). NEVER commit.
+    # Generate with: python -m app.crypto generate-key
+    paide_enc_key: Optional[str] = None
+
+    # Allow plain HTTP for explicitly local development endpoints. Remote
+    # providers must use HTTPS. Defaults to False for safety.
+    allow_local_http: bool = False
+
+    # Comma-separated allowlist of loopback hosts permitted for custom local
+    # endpoints (e.g. "localhost,127.0.0.1"). Used by the SSRF guard.
+    local_endpoint_hosts: str = "localhost,127.0.0.1,::1"
+
+    # Legacy provider API keys (from backend/.env) — still supported for
+    # backward compatibility. Never exposed to the browser.
     gemini_api_key: Optional[str] = None
     groq_api_key: Optional[str] = None
     cerebras_api_key: Optional[str] = None
@@ -46,3 +60,11 @@ def db_path() -> Path:
     p = Path(rel).resolve()
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def local_endpoint_allowlist() -> set[str]:
+    return {h.strip() for h in settings.local_endpoint_hosts.split(",") if h.strip()}
+
+
+def is_encryption_configured() -> bool:
+    return bool(os.environ.get("PAIDE_ENC_KEY")) or settings.paide_enc_key is not None

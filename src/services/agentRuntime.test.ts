@@ -4,6 +4,7 @@ import { DevProvider } from '@/services/providers/devProvider';
 import { StubProvider } from '@/services/providers/stubProvider';
 import { createMockRepositories } from '@/services/test-helpers';
 import type { AIProvider } from '@/services/providers/aiProvider';
+import type { AgentRequest } from '@/types/agent';
 import type { ProviderId } from '@/types';
 
 function makeRuntime(opts: { devProvider?: AIProvider; resolveProvider?: (id: ProviderId) => AIProvider | null } = {}) {
@@ -19,7 +20,7 @@ function makeRuntime(opts: { devProvider?: AIProvider; resolveProvider?: (id: Pr
   };
 }
 
-function makeRequest(conversationId: string, message: string, overrides: Record<string, unknown> = {}) {
+function makeRequest(conversationId: string, message: string, overrides: Record<string, unknown> = {}): AgentRequest {
   return {
     conversationId,
     message,

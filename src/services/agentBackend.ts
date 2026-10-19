@@ -27,7 +27,7 @@ interface AgentRunPayload {
   userMessage?: { id: string; conversationId: string; role: string; content: string; createdAt: number };
   assistantMessage?: { id: string; conversationId: string; role: string; content: string; createdAt: number };
   error?: { code: string; message: string };
-  meta?: { providerId: string; model?: string; simulated?: boolean; finishReason?: string };
+  meta?: { providerId: string; connectionId?: string; model?: string; simulated?: boolean; finishReason?: string; usage?: unknown };
   startedAt: number;
   finishedAt: number;
 }
@@ -40,6 +40,7 @@ export async function runAgentViaBackend(input: BackendAgentRunInput): Promise<A
       message: input.message,
       model: input.config.model,
       providerId: input.config.providerId,
+      connectionId: input.config.connectionId,
       systemPrompt: input.config.systemPrompt,
       allowSimulation: input.config.allowSimulation === true,
       maxContextChars: input.config.maxContextChars ?? 24000,
@@ -73,6 +74,7 @@ function toAgentResult(p: AgentRunPayload): AgentResult {
     meta: p.meta
       ? {
           providerId: p.meta.providerId as ProviderId | 'dev',
+          connectionId: p.meta.connectionId,
           model: p.meta.model,
           simulated: p.meta.simulated,
           finishReason: p.meta.finishReason,

@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Dialog } from './ui/Dialog';
 import { Button } from './ui/Button';
+import { ConnectionsPanel } from './ConnectionsPanel';
 import type { Provider, ProviderId } from '@/types';
 
 interface Props {
@@ -12,10 +13,10 @@ interface Props {
   onSave: () => void;
 }
 
-const sections = ['General', 'AI Providers', 'Editor', 'Appearance', 'Shortcuts'] as const;
+const sections = ['General', 'AI Providers', 'AI Connections', 'Editor', 'Appearance', 'Shortcuts'] as const;
 
 export function SettingsDialog({ open, onClose, providers, activeProvider, onProviderChange, onSave }: Props) {
-  const [section, setSection] = useState<(typeof sections)[number]>('AI Providers');
+  const [section, setSection] = useState<(typeof sections)[number]>('AI Connections');
   const [apiKey, setApiKey] = useState('');
 
   return (
@@ -23,12 +24,12 @@ export function SettingsDialog({ open, onClose, providers, activeProvider, onPro
       open={open}
       onClose={onClose}
       title="Settings"
-      description="Configure your AI IDE. Changes are demo-only in this phase."
-      width="max-w-2xl"
+      description="Configure your AI IDE, connections, and API keys."
+      width="max-w-3xl"
       footer={
         <>
           <Button variant="ghost" size="md" onClick={onClose}>
-            Cancel
+            Close
           </Button>
           <Button
             variant="primary"
@@ -38,13 +39,13 @@ export function SettingsDialog({ open, onClose, providers, activeProvider, onPro
               onClose();
             }}
           >
-            Save changes
+            Done
           </Button>
         </>
       }
     >
       <div className="flex gap-6">
-        <nav className="w-40 shrink-0">
+        <nav className="w-44 shrink-0">
           {sections.map((s) => (
             <button
               key={s}
@@ -59,8 +60,14 @@ export function SettingsDialog({ open, onClose, providers, activeProvider, onPro
         </nav>
 
         <div className="min-w-0 flex-1">
+          {section === 'AI Connections' && <ConnectionsPanel />}
+
           {section === 'AI Providers' && (
             <div className="space-y-3">
+              <div className="rounded-md border border-surface-700 bg-surface-800 px-3 py-2 text-2xs text-surface-300">
+                This section shows the built-in provider list. To add real API keys and custom
+                connections, use the <span className="text-accent-300">AI Connections</span> tab.
+              </div>
               {providers.map((p) => {
                 const active = p.id === activeProvider;
                 return (
@@ -99,7 +106,7 @@ export function SettingsDialog({ open, onClose, providers, activeProvider, onPro
                       type="password"
                       value={active ? apiKey : ''}
                       onChange={(e) => setApiKey(e.target.value)}
-                      placeholder={`${p.name} API key`}
+                      placeholder={`${p.name} API key (legacy — use AI Connections)`}
                       className="mt-2 w-full rounded-md border border-surface-600 bg-surface-850 px-2.5 py-1.5 font-mono text-2xs text-gray-100 placeholder:text-surface-400 focus:border-accent-500/50 focus:outline-none"
                     />
                   </div>

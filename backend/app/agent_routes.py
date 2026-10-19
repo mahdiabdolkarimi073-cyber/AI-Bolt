@@ -1,17 +1,17 @@
 """Agent execution route for the FastAPI backend.
 
-Exposes a single POST /agent/run endpoint that:
+Exposes POST /agent/run. The route:
   - validates conversation id, message, and request size,
   - uses the same authoritative persistence path (MessageRepo) as other routes,
-  - proxies the request through a provider adapter (Phase 6 wires real ones),
+  - resolves the configured connection + adapter and proxies the request,
   - supports a deterministic simulation mode for local testing,
-  - applies a reasonable timeout,
+  - applies a timeout,
   - never leaks secrets or internal exception details.
 
-In Phase 5, real provider integrations are not wired. When `simulate` is true,
-the backend uses a deterministic dev responder so the full lifecycle can be
-exercised locally. When `simulate` is false and no real provider is configured,
-the endpoint returns a clear `provider_not_configured` error.
+Real AI requests use configured connections (see connection_routes.py). When
+no connection is configured, the route returns a clear
+`provider_not_configured` error — it NEVER silently falls back to a simulated
+response when simulation is disabled.
 """
 from __future__ import annotations
 
@@ -19,12 +19,14 @@ import time
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, status, Request
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
-from app.config import settings
 from app.db import connect
 from app.repositories import ConversationRepo, MessageRepo
+from app.connection_repos import ConnectionRepo, CredentialRepo, AgentDefaultsRepo
+from app.adapters import resolve_adapter, AdapterError, CATEGORY_OK
+from app.crypto import is_encryption_available
 
 
 router = APIRouter(prefix="/agent", tags=["agent"])
@@ -33,8 +35,11 @@ router = APIRouter(prefix="/agent", tags=["agent"])
 class AgentRunRequest(BaseModel):
     conversationId: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1, max_length=32000)
-    model: str = Field(default="gemini-2.0-flash", max_length=120)
-    providerId: str = Field(default="gemini", max_length=60)
+    # connectionId selects a configured connection. When omitted, the agent
+    # default connection is used.
+    connectionId: Optional[str] = None
+    model: str = Field(default="", max_length=120)
+    providerId: str = Field(default="", max_length=60)
     systemPrompt: Optional[str] = Field(default=None, max_length=4000)
     allowSimulation: bool = False
     maxContextChars: int = Field(default=24000, ge=0, le=200000)
@@ -53,36 +58,32 @@ class AgentRunResponse(BaseModel):
     finishedAt: int
 
 
-def _provider_configured(pid: str) -> bool:
-    """Return True if the provider has an API key configured in backend/.env."""
-    key_map = {
-        "gemini": settings.gemini_api_key,
-        "groq": settings.groq_api_key,
-        "cerebras": settings.cerebras_api_key,
-        "openrouter": settings.openrouter_api_key,
-    }
-    key = key_map.get(pid)
-    return bool(key)
-
-
 def _simulated_response(message: str) -> str:
     """Deterministic simulated response for local testing. Clearly marked."""
     preview = message.strip().split("\n")[0][:80]
     return (
         "[Simulated response — no real model was contacted] "
         f"You said: {preview}. This is a deterministic development reply used to "
-        "exercise the Agent lifecycle locally. Configure a provider API key in "
-        "backend/.env and set allowSimulation=false to use a real model (Phase 6)."
+        "exercise the Agent lifecycle locally. Configure a real connection in "
+        "Settings to use a real model."
     )
 
 
+def _resolve_connection(conn, connection_id: Optional[str]) -> Optional[dict]:
+    if connection_id:
+        return ConnectionRepo.get(conn, connection_id)
+    defaults = AgentDefaultsRepo.get(conn)
+    if defaults["connectionId"]:
+        return ConnectionRepo.get(conn, defaults["connectionId"])
+    return None
+
+
 @router.post("/run", response_model=AgentRunResponse)
-def run_agent(body: AgentRunRequest, req: Request):
+def run_agent(body: AgentRunRequest):
     started = int(time.time() * 1000)
     request_id = str(uuid.uuid4())
 
     with connect() as conn:
-        # Validate conversation exists.
         conv = ConversationRepo.get(conn, body.conversationId)
         if not conv:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
@@ -95,14 +96,25 @@ def run_agent(body: AgentRunRequest, req: Request):
             content=body.message,
         )
 
-        configured = _provider_configured(body.providerId)
+        connection = _resolve_connection(conn, body.connectionId)
 
-        # If a real provider is configured, Phase 6 will proxy here.
-        # In Phase 5 we only support simulation; otherwise return a clear error.
-        if not body.allowSimulation and not configured:
-            # Remove the user message to avoid orphaned partial runs? No — the
-            # user message is legitimately saved. We return a failed run with
-            # the user message attached so the UI can show it.
+        # No real connection configured.
+        if not connection or not connection["enabled"]:
+            if body.allowSimulation:
+                content = _simulated_response(body.message)
+                assistant_msg = MessageRepo.append(
+                    conn, conversation_id=body.conversationId, role="assistant", content=content
+                )
+                return AgentRunResponse(
+                    requestId=request_id,
+                    conversationId=body.conversationId,
+                    status="completed",
+                    userMessage=user_msg,
+                    assistantMessage=assistant_msg,
+                    meta={"providerId": "dev", "model": body.model or "dev-simulated", "simulated": True, "finishReason": "stop"},
+                    startedAt=started,
+                    finishedAt=int(time.time() * 1000),
+                )
             return AgentRunResponse(
                 requestId=request_id,
                 conversationId=body.conversationId,
@@ -111,11 +123,39 @@ def run_agent(body: AgentRunRequest, req: Request):
                 error={
                     "code": "provider_not_configured",
                     "message": (
-                        f"Provider '{body.providerId}' has no API key configured in "
-                        "backend/.env, and simulation is disabled. Set an API key "
-                        "or enable allowSimulation to test the Agent locally."
+                        "No AI connection is configured. Open Settings → AI Connections "
+                        "to add a provider connection, or enable simulation to test the "
+                        "Agent lifecycle locally."
                     ),
                 },
+                startedAt=started,
+                finishedAt=int(time.time() * 1000),
+            )
+
+        # Connection exists but encryption is unavailable — fail safe.
+        if not is_encryption_available():
+            return AgentRunResponse(
+                requestId=request_id,
+                conversationId=body.conversationId,
+                status="failed",
+                userMessage=user_msg,
+                error={
+                    "code": "provider_unavailable",
+                    "message": "Credential storage is not configured. Set PAIDE_ENC_KEY on the backend.",
+                },
+                startedAt=started,
+                finishedAt=int(time.time() * 1000),
+            )
+
+        # Resolve the model to use.
+        model = body.model or connection["defaultModel"] or ""
+        if not model:
+            return AgentRunResponse(
+                requestId=request_id,
+                conversationId=body.conversationId,
+                status="failed",
+                userMessage=user_msg,
+                error={"code": "invalid_request", "message": "No model selected. Add a model to the connection in Settings."},
                 startedAt=started,
                 finishedAt=int(time.time() * 1000),
             )
@@ -124,10 +164,8 @@ def run_agent(body: AgentRunRequest, req: Request):
         history = MessageRepo.list(conn, body.conversationId)
         prior = [m for m in history if m["id"] != user_msg["id"]]
 
-        # Apply message-count + character budget (approximation).
         if body.maxHistoryMessages > 0 and len(prior) > body.maxHistoryMessages:
             prior = prior[-body.maxHistoryMessages:]
-
         if body.maxContextChars > 0:
             kept = []
             used = 0
@@ -139,46 +177,105 @@ def run_agent(body: AgentRunRequest, req: Request):
                 used += cost
             prior = kept
 
-        # Produce the assistant response. Phase 5: deterministic simulation only.
-        content = _simulated_response(body.message)
-        simulated = True
-        if configured and not body.allowSimulation:
-            # Phase 6 will replace this branch with a real provider call.
-            # For now, treat as not-yet-implemented but configured.
-            content = (
-                "[Provider configured but not yet implemented in Phase 5] "
-                "An API key is set for this provider, but the actual provider "
-                "integration ships in Phase 6. Enable allowSimulation to test "
-                "the Agent lifecycle locally."
-            )
-            simulated = True
+        # Build the message list for the adapter.
+        messages: list[dict] = []
+        if body.systemPrompt:
+            messages.append({"role": "system", "content": body.systemPrompt})
+        for m in prior:
+            messages.append({"role": m["role"], "content": m["content"]})
+        messages.append({"role": "user", "content": body.message})
 
+        # Resolve the adapter.
+        try:
+            adapter = resolve_adapter(connection["adapter"])
+        except ValueError:
+            return AgentRunResponse(
+                requestId=request_id,
+                conversationId=body.conversationId,
+                status="failed",
+                userMessage=user_msg,
+                error={"code": "provider_unavailable", "message": "Unknown adapter for this connection."},
+                startedAt=started,
+                finishedAt=int(time.time() * 1000),
+            )
+
+        # Select a credential (primary enabled key, else failover).
+        secret, _cred = CredentialRepo.select_secret(conn, connection["id"])
+        if not secret:
+            return AgentRunResponse(
+                requestId=request_id,
+                conversationId=body.conversationId,
+                status="failed",
+                userMessage=user_msg,
+                error={"code": "provider_not_ready", "message": "No enabled API key for this connection."},
+                startedAt=started,
+                finishedAt=int(time.time() * 1000),
+            )
+
+        # Execute through the adapter.
+        try:
+            result = adapter.chat(
+                connection["baseUrl"],
+                secret,
+                model,
+                messages,
+                timeout=30.0,
+            )
+        except AdapterError as exc:
+            return AgentRunResponse(
+                requestId=request_id,
+                conversationId=body.conversationId,
+                status="failed",
+                userMessage=user_msg,
+                error={"code": exc.category, "message": exc.message},
+                meta={"providerId": connection["adapter"], "model": model, "simulated": False},
+                startedAt=started,
+                finishedAt=int(time.time() * 1000),
+            )
+        except Exception:
+            # Never leak internal exception details.
+            return AgentRunResponse(
+                requestId=request_id,
+                conversationId=body.conversationId,
+                status="failed",
+                userMessage=user_msg,
+                error={"code": "provider_failed", "message": "The provider request failed unexpectedly."},
+                meta={"providerId": connection["adapter"], "model": model, "simulated": False},
+                startedAt=started,
+                finishedAt=int(time.time() * 1000),
+            )
+
+        # Persist the assistant message (authoritative path).
         assistant_msg = MessageRepo.append(
             conn,
             conversation_id=body.conversationId,
             role="assistant",
-            content=content,
+            content=result.content,
         )
 
-    return AgentRunResponse(
-        requestId=request_id,
-        conversationId=body.conversationId,
-        status="completed",
-        userMessage=user_msg,
-        assistantMessage=assistant_msg,
-        meta={
-            "providerId": body.providerId,
-            "model": body.model,
-            "simulated": simulated,
-            "finishReason": "stop",
-        },
-        startedAt=started,
-        finishedAt=int(time.time() * 1000),
-    )
+        # Mark the connection status based on success.
+        ConnectionRepo.update(conn, connection["id"], status="connected")
+
+        return AgentRunResponse(
+            requestId=request_id,
+            conversationId=body.conversationId,
+            status="completed",
+            userMessage=user_msg,
+            assistantMessage=assistant_msg,
+            meta={
+                "providerId": connection["adapter"],
+                "connectionId": connection["id"],
+                "model": model,
+                "simulated": False,
+                "finishReason": result.finish_reason,
+                "usage": result.usage,
+            },
+            startedAt=started,
+            finishedAt=int(time.time() * 1000),
+        )
 
 
 @router.post("/cancel/{cid}", status_code=status.HTTP_202_ACCEPTED)
 def cancel_agent(cid: str):
-    """Cancel is best-effort. Phase 5 requests are synchronous, so this is a
-    no-op stub that documents the contract for Phase 6 streaming runs."""
-    return {"conversationId": cid, "cancelled": False, "note": "Cancellation of synchronous Phase 5 runs is handled client-side via AbortSignal."}
+    """Cancel is best-effort. Synchronous requests are handled client-side."""
+    return {"conversationId": cid, "cancelled": False, "note": "Cancellation of synchronous runs is handled client-side via AbortSignal."}

@@ -45,6 +45,10 @@ export interface AgentSystemPrompt {
 export interface AgentConfig {
   providerId: ProviderId;
   model: string;
+  /** Phase 6: optional configured connection id. When set, the backend routes
+   *  the request through that connection's adapter + credentials. When absent,
+   *  the backend uses the configured agent default connection. */
+  connectionId?: string;
   /** Soft character limit for context construction. When no reliable token
    *  counter is available, this is an approximation and must be reported as
    *  such. 0 = no limit. */
@@ -75,6 +79,8 @@ export interface AgentRequest {
  *  because providers differ — never invent values the provider did not return. */
 export interface ProviderExecutionMeta {
   providerId: ProviderId | 'dev';
+  /** Phase 6: the configured connection id used, when available. */
+  connectionId?: string;
   model?: string;
   /** True if the response came from a development/test/simulated provider. */
   simulated?: boolean;
@@ -209,6 +215,17 @@ function mapApiCode(code: string): AgentErrorCode {
       return 'provider_unavailable';
     case 'validation':
       return 'invalid_request';
+    case 'provider_not_configured':
+    case 'provider_not_ready':
+      return 'provider_not_ready';
+    case 'auth_failed':
+    case 'rate_limited':
+    case 'quota_or_billing':
+    case 'invalid_model':
+    case 'invalid_endpoint':
+    case 'network_error':
+    case 'provider_error':
+      return 'provider_failed';
     default:
       return 'unknown';
   }
