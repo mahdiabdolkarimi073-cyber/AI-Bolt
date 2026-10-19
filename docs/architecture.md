@@ -149,6 +149,73 @@ keys stay server-side.
 - Agent execution loop, terminal execution, memory/RAG layer.
 - Auth, sharing, billing — intentionally not started.
 
+## Phase 9 — On-disk workspace & project context
+
+Phase 9 adds real filesystem access for imported projects, integrated into the
+existing FastAPI backend. The frontend never touches the filesystem directly —
+all operations go through validated backend routes.
+
+### Workspace storage
+
+- **Migration 0004** adds `workspace_path`, `import_source`, and
+  `last_opened_at` columns to `projects`, plus a `recent_projects` table.
+- Each imported project lives in its own directory under `WORKSPACE_ROOT`.
+- `app/filesystem.py` is the centralized security service: path validation,
+  symlink-escape detection, drive/UNC rejection, file-size/count limits, and
+  the excluded-directory set shared by search and Agent context.
+- `app/workspace_routes.py` exposes: lazy tree listing, file CRUD, directory
+  creation, rename, filename/content search, ZIP import, empty-project
+  creation, recent-projects list, and destructive on-disk deletion.
+- `app/agent_file_tools.py` provides read-only project-context retrieval for
+  the Agent, with secret-file exclusion and bounded character budgets.
+
+### Security posture (Phase 9 additions)
+
+| Concern                        | Mitigation                                                |
+|--------------------------------|------------------------------------------------------------|
+| ZIP Slip                       | `_validate_zip_entry` rejects `..`, absolute, drive, UNC.  |
+| Symlink escape                 | `safe_resolve_in_project` resolves each component and      |
+|                                | rejects links pointing outside the project root.           |
+| Archive bombs                  | `MAX_ARCHIVE_BYTES`, `MAX_EXTRACTED_BYTES`,                |
+|                                | `MAX_EXTRACTED_FILES`, `MAX_SINGLE_FILE_BYTES` enforced.   |
+| Partial extraction cleanup     | `shutil.rmtree` on any failure during import.              |
+| Project-root deletion          | `delete_path` and `delete_project_files` refuse to remove  |
+|                                | the project root or workspace root.                        |
+| Secret files in Agent context  | `SECRET_FILE_PATTERNS` skips `.env`, credentials, keys,    |
+|                                | `.pem` files from broad searches and context collection.   |
+| Project isolation              | Every file operation resolves the project root from the DB |
+|                                | record; Agent context uses only the active project's root. |
+
+### Test coverage (Phase 9)
+
+Backend tests run with `pytest` from `backend/`:
+
+| File | Tests | Coverage |
+|------|-------|----------|
+| `tests/test_filesystem.py` | 22 | Path validation, traversal, symlink escape/allow, file-size limits, excluded dirs |
+| `tests/test_zip_import.py` | 11 | ZIP Slip, absolute/drive entries, archive limits, cleanup on failure, happy paths |
+| `tests/test_workspace_routes.py` | 18 | File CRUD, confirm guards, directory ops, rename, tree, search, project isolation, persist-after-restart |
+| `tests/test_agent_file_tools.py` | 18 | Secret exclusion, excluded dirs, context scoping, budget bounds, reference framing |
+
+Frontend tests run with `vitest`:
+
+| File | Tests | Coverage |
+|------|-------|----------|
+| `src/services/workspace.test.ts` | 20 | Path sanitization, confirm guards, request construction, error handling |
+| `src/services/agentBackendProjectContext.test.ts` | 4 | projectId forwarding, retrieval bounds, error mapping |
+
+All tests use temporary directories and isolated SQLite databases — no test
+ever touches a real user project directory.
+
+### What still needs manual Windows verification
+
+- Symlink behavior on NTFS/junctions differs from POSIX and is skipped on
+  Windows in the test suite.
+- ZIP import of real-world large archives (near the 256 MB limit) should be
+  smoke-tested on the target machine.
+- End-to-end editor round-trip (open → edit → save → reopen) through a running
+  FastAPI backend on Windows.
+
 ## Bolt preview vs. local execution
 
 The Bolt preview environment does not run the Python backend. The frontend
