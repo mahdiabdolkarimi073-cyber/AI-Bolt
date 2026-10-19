@@ -239,4 +239,60 @@ MIGRATIONS: list[tuple[str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_recent_opened ON recent_projects(opened_at DESC);
         """,
     ),
+    (
+        "0005_terminal_sessions",
+        """
+        -- Phase 10: real terminal / process execution sessions.
+        -- Records metadata for each executed process. Output is NOT stored here —
+        -- only bounded metadata (status, exit code, timing, truncation flags).
+        -- Output streaming goes over WebSocket and is kept in-memory, optionally
+        -- flushed to a bounded on-disk ring buffer per session.
+        CREATE TABLE IF NOT EXISTS terminal_sessions (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            command TEXT NOT NULL,
+            working_dir TEXT NOT NULL,
+            shell TEXT,
+            kind TEXT NOT NULL DEFAULT 'command'
+                CHECK (kind IN ('command','run','test','build','typecheck','lint','deps','preview')),
+            source TEXT NOT NULL DEFAULT 'user'
+                CHECK (source IN ('user','ai_proposed')),
+            long_running INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending','running','completed','failed','stopped','timeout')),
+            exit_code INTEGER,
+            started_at INTEGER NOT NULL,
+            finished_at INTEGER,
+            output_chars INTEGER NOT NULL DEFAULT 0,
+            truncated INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_term_sessions_project ON terminal_sessions(project_id);
+        CREATE INDEX IF NOT EXISTS idx_term_sessions_status ON terminal_sessions(status);
+        CREATE INDEX IF NOT EXISTS idx_term_sessions_started ON terminal_sessions(started_at DESC);
+
+        -- Bounded snippet of the most recent output for a session, for the UI to
+        -- restore state after a reconnect. Not a full transcript log.
+        CREATE TABLE IF NOT EXISTS terminal_output_snippets (
+            session_id TEXT PRIMARY KEY,
+            tail_text TEXT NOT NULL DEFAULT '',
+            tail_chars INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES terminal_sessions(id) ON DELETE CASCADE
+        );
+
+        -- Detected project runtime profile (cached). One row per project.
+        CREATE TABLE IF NOT EXISTS project_runtime (
+            project_id TEXT PRIMARY KEY,
+            runtime TEXT NOT NULL DEFAULT 'unknown',
+            language TEXT,
+            framework TEXT,
+            package_manager TEXT,
+            manifest TEXT,
+            detected_at INTEGER NOT NULL,
+            details TEXT,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        """,
+    ),
 ]

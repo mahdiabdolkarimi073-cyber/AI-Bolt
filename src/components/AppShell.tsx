@@ -9,13 +9,16 @@ import { SettingsDialog } from './SettingsDialog';
 import { ProjectDialog } from './ProjectDialog';
 import { PromptDialog } from './PromptDialog';
 import { ConfirmDialog } from './ConfirmDialog';
+import { DiagnoseDialog } from './DiagnoseDialog';
 import { useSettings } from '@/hooks/useSettings';
 import { useAgentChat } from '@/hooks/useAgentChat';
 import { useWorkspace, type OpenFileTab } from '@/hooks/useWorkspace';
+import { useTerminal } from '@/hooks/useTerminal';
 import { config } from '@/config';
 import { getRepositories } from '@/services/index';
 import { workspaceService } from '@/services/workspace';
 import { providers as allProviders } from '@/data/mock';
+import type { ProposedChange } from '@/types/execution';
 import type {
   ProviderId,
   SidebarSection,
@@ -129,6 +132,9 @@ export function AppShell() {
 
   const [bottomOpen, setBottomOpen] = useState(true);
   const [bottomTab, setBottomTab] = useState<BottomTab>('terminal');
+  const [bottomHeight, setBottomHeight] = useState(240);
+
+  const terminal = useTerminal(projectId);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [projectDialog, setProjectDialog] = useState<{ open: boolean; mode: 'open' | 'new' }>({
@@ -233,6 +239,42 @@ export function AppShell() {
 
   const activeTab = workspace.tabs.find((t) => t.id === workspace.activeTabId) ?? null;
 
+  const handleApplyDiagnosis = useCallback(
+    async (changes: ProposedChange[]) => {
+      if (!workspace.activeProject) return;
+      const pid = workspace.activeProject.id;
+      for (const change of changes) {
+        try {
+          const existing = await workspaceService.readFile(pid, change.path);
+          const updated = change.original
+            ? existing.content.replace(change.original, change.updated)
+            : change.updated;
+          await workspaceService.writeFile(pid, change.path, updated, { overwrite: true });
+        } catch (e) {
+          workspace.setError(e instanceof Error ? e.message : 'Failed to apply proposed change.');
+        }
+      }
+      await workspace.refreshTree();
+    },
+    [workspace],
+  );
+
+  const handleRerunDiagnosis = useCallback(
+    (sessionId: string) => {
+      const session = terminal.sessions.find((s) => s.id === sessionId);
+      if (session) {
+        void terminal.runCommand({
+          command: session.command,
+          kind: session.kind,
+          source: 'user',
+          longRunning: session.longRunning,
+        });
+      }
+      terminal.dismissDiagnosis();
+    },
+    [terminal],
+  );
+
   return (
     <div className="flex h-screen min-h-0 flex-col overflow-hidden bg-surface-950 text-gray-200">
       <TopBar
@@ -328,6 +370,8 @@ export function AppShell() {
             onToggle={() => setBottomOpen((o) => !o)}
             activeTab={bottomTab}
             onTabChange={setBottomTab}
+            terminal={terminal}
+            height={bottomHeight}
           />
         </div>
       </div>
@@ -400,6 +444,17 @@ export function AppShell() {
         destructive
         onConfirm={handleConfirmDelete}
         onClose={() => setConfirmState({ kind: 'none' })}
+      />
+
+      <DiagnoseDialog
+        open={terminal.pendingDiagnosis !== null}
+        analysis={terminal.pendingDiagnosis?.analysis ?? ''}
+        changes={terminal.pendingDiagnosis?.changes ?? []}
+        busy={terminal.diagnosisBusy}
+        applying={false}
+        onApply={handleApplyDiagnosis}
+        onRerun={terminal.pendingDiagnosis ? () => handleRerunDiagnosis(terminal.pendingDiagnosis!.sessionId) : undefined}
+        onClose={() => terminal.dismissDiagnosis()}
       />
     </div>
   );

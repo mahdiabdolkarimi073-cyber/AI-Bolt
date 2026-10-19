@@ -1,24 +1,23 @@
-import { useState } from 'react';
 import {
   Terminal as TerminalIcon,
   AlertTriangle,
-  Info,
   ScrollText,
   FlaskConical,
   ChevronDown,
-  Trash2,
   X,
-  CheckCircle2,
-  MinusCircle,
 } from 'lucide-react';
 import type { BottomTab } from '@/types';
-import { sampleTerminalLines, sampleProblems, sampleOutput, sampleTests } from '@/data/mock';
+import { sampleProblems, sampleOutput, sampleTests } from '@/data/mock';
+import { TerminalPanel } from './TerminalPanel';
+import type { UseTerminalResult } from '@/hooks/useTerminal';
 
 interface Props {
   open: boolean;
   onToggle: () => void;
   activeTab: BottomTab;
   onTabChange: (t: BottomTab) => void;
+  terminal: UseTerminalResult;
+  height: number;
 }
 
 const tabs: { id: BottomTab; label: string; icon: typeof TerminalIcon; badge?: number }[] = [
@@ -28,9 +27,9 @@ const tabs: { id: BottomTab; label: string; icon: typeof TerminalIcon; badge?: n
   { id: 'tests', label: 'Tests', icon: FlaskConical },
 ];
 
-export function BottomPanel({ open, onToggle, activeTab, onTabChange }: Props) {
+export function BottomPanel({ open, onToggle, activeTab, onTabChange, terminal, height }: Props) {
   return (
-    <div className="flex shrink-0 flex-col border-t border-surface-700 bg-surface-900" style={{ height: open ? 200 : 32 }}>
+    <div className="flex shrink-0 flex-col border-t border-surface-700 bg-surface-900" style={{ height: open ? height : 32 }}>
       {/* tab bar */}
       <div className="flex h-8 shrink-0 items-center justify-between border-b border-surface-800 pr-2">
         <div className="flex h-full items-stretch">
@@ -53,6 +52,9 @@ export function BottomPanel({ open, onToggle, activeTab, onTabChange }: Props) {
                 {active && open && <span className="absolute left-0 top-0 h-[2px] w-full bg-accent-500" />}
                 <Icon size={13} />
                 {t.label}
+                {t.id === 'terminal' && terminal.sessions.length > 0 && (
+                  <span className="ml-0.5 rounded-full bg-surface-700 px-1.5 text-[10px] text-surface-300">{terminal.sessions.length}</span>
+                )}
                 {t.badge ? (
                   <span className="ml-0.5 rounded-full bg-surface-700 px-1.5 text-[10px] text-surface-300">{t.badge}</span>
                 ) : null}
@@ -61,13 +63,6 @@ export function BottomPanel({ open, onToggle, activeTab, onTabChange }: Props) {
           })}
         </div>
         <div className="flex items-center gap-0.5">
-          <button
-            className="rounded p-1 text-surface-300 transition-colors hover:bg-surface-750 hover:text-gray-100"
-            aria-label="Clear"
-            title="Clear"
-          >
-            <Trash2 size={13} />
-          </button>
           <button
             onClick={onToggle}
             className="rounded p-1 text-surface-300 transition-colors hover:bg-surface-750 hover:text-gray-100"
@@ -89,32 +84,25 @@ export function BottomPanel({ open, onToggle, activeTab, onTabChange }: Props) {
 
       {/* content */}
       {open && (
-        <div className="min-h-0 flex-1 overflow-auto scrollbar-thin">
-          {activeTab === 'terminal' && <TerminalView />}
-          {activeTab === 'problems' && <ProblemsView />}
-          {activeTab === 'output' && <OutputView />}
-          {activeTab === 'tests' && <TestsView />}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function TerminalView() {
-  return (
-    <div className="px-3 py-2 font-mono text-2xs leading-relaxed">
-      {sampleTerminalLines.map((line, i) => (
-        <div key={i} className="whitespace-pre text-gray-300">
-          {line.startsWith('$') ? (
-            <span>
-              <span className="text-success-500">$</span>
-              {line.slice(1)}
-            </span>
-          ) : (
-            line || <span>&nbsp;</span>
+        <div className="min-h-0 flex-1 overflow-hidden">
+          {activeTab === 'terminal' && <TerminalPanel terminal={terminal} height={height - 32} />}
+          {activeTab === 'problems' && (
+            <div className="h-full overflow-auto scrollbar-thin">
+              <ProblemsView />
+            </div>
+          )}
+          {activeTab === 'output' && (
+            <div className="h-full overflow-auto scrollbar-thin">
+              <OutputView />
+            </div>
+          )}
+          {activeTab === 'tests' && (
+            <div className="h-full overflow-auto scrollbar-thin">
+              <TestsView />
+            </div>
           )}
         </div>
-      ))}
+      )}
     </div>
   );
 }
@@ -127,7 +115,7 @@ function ProblemsView() {
           {p.severity === 'warning' ? (
             <AlertTriangle size={13} className="shrink-0 text-warning-500" />
           ) : (
-            <Info size={13} className="shrink-0 text-accent-400" />
+            <ScrollText size={13} className="shrink-0 text-accent-400" />
           )}
           <span className="shrink-0 text-surface-300">{p.severity}</span>
           <span className="min-w-0 truncate text-gray-200">{p.message}</span>
@@ -165,11 +153,9 @@ function TestsView() {
       {sampleTests.map((t, i) => (
         <div key={i} className="flex items-center gap-2 rounded px-2 py-1 text-2xs hover:bg-surface-800">
           {t.status === 'pass' ? (
-            <CheckCircle2 size={13} className="shrink-0 text-success-500" />
-          ) : t.status === 'skip' ? (
-            <MinusCircle size={13} className="shrink-0 text-surface-400" />
+            <FlaskConical size={13} className="shrink-0 text-success-500" />
           ) : (
-            <X size={13} className="shrink-0 text-error-400" />
+            <FlaskConical size={13} className="shrink-0 text-error-400" />
           )}
           <span className="min-w-0 truncate text-gray-200">{t.name}</span>
           <span className="ml-auto shrink-0 font-mono text-surface-400">{t.time}</span>
