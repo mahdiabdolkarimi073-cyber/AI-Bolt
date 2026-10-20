@@ -295,4 +295,48 @@ MIGRATIONS: list[tuple[str, str]] = [
         );
         """,
     ),
+    (
+        "0006_snapshots_proposals",
+        """
+        -- Phase 12: bounded file snapshots for undo/recovery.
+        -- Stores the previous content of a file before each write so the user
+        -- can restore the last known-good state. NOT a full VCS — only the most
+        -- recent snapshot per (project_id, rel_path) is kept.
+        CREATE TABLE IF NOT EXISTS file_snapshots (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            rel_path TEXT NOT NULL,
+            content TEXT NOT NULL,
+            content_chars INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            note TEXT,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        -- One snapshot per (project, path): upsert replaces on conflict.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_project_path
+            ON file_snapshots(project_id, rel_path);
+        CREATE INDEX IF NOT EXISTS idx_snapshots_project ON file_snapshots(project_id);
+        CREATE INDEX IF NOT EXISTS idx_snapshots_created ON file_snapshots(created_at DESC);
+
+        -- Phase 12: change proposals from AI diagnosis / agent.
+        -- Records AI-proposed {path, original, updated} changes before the user
+        -- reviews and approves them. Cleared when applied or dismissed.
+        CREATE TABLE IF NOT EXISTS change_proposals (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            diagnosis_id TEXT,
+            rel_path TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            original_snippet TEXT NOT NULL DEFAULT '',
+            updated_snippet TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending','applied','dismissed')),
+            created_at INTEGER NOT NULL,
+            applied_at INTEGER,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_proposals_project ON change_proposals(project_id);
+        CREATE INDEX IF NOT EXISTS idx_proposals_status ON change_proposals(status);
+        """,
+    ),
 ]
