@@ -11,6 +11,8 @@ import type {
   AddModelInput,
   UpdateModelInput,
   ConnectionTestResult,
+  ProviderPreset,
+  DiagnosticEvent,
 } from '@/types/connections';
 import * as connApi from '@/services/connectionService';
 
@@ -42,6 +44,10 @@ export interface UseConnectionsReturn extends UseConnectionsState {
   deleteModel: (connectionId: string, modelId: string) => Promise<boolean>;
   testConnection: (connectionId: string, model: string, credentialId?: string) => Promise<ConnectionTestResult | null>;
   setDefaults: (connectionId: string | null, model: string | null) => Promise<boolean>;
+  refreshModels: (connectionId: string) => Promise<string[] | null>;
+  loadPresets: () => Promise<ProviderPreset[] | null>;
+  loadDiagnostics: (connectionId?: string) => Promise<DiagnosticEvent[] | null>;
+  clearDiagnostics: (connectionId?: string) => Promise<boolean>;
   clearError: () => void;
 }
 
@@ -239,6 +245,41 @@ export function useConnections(): UseConnectionsReturn {
 
   const clearError = useCallback(() => setState((s) => ({ ...s, error: null })), []);
 
+  const refreshModels = useCallback(
+    async (connectionId: string): Promise<string[] | null> => {
+      const { data, error } = await connApi.refreshModels(connectionId);
+      if (error) {
+        setState((s) => ({ ...s, error: toMessage(error, 'Failed to refresh models.') }));
+        return null;
+      }
+      return data;
+    },
+    [],
+  );
+
+  const loadPresets = useCallback(async (): Promise<ProviderPreset[] | null> => {
+    const { data, error } = await connApi.listPresets();
+    if (error) {
+      return null;
+    }
+    return data;
+  }, []);
+
+  const loadDiagnostics = useCallback(async (connectionId?: string): Promise<DiagnosticEvent[] | null> => {
+    const { data, error } = await connApi.listDiagnostics(connectionId);
+    if (error) return null;
+    return data;
+  }, []);
+
+  const clearDiagnostics = useCallback(async (connectionId?: string): Promise<boolean> => {
+    const { error } = await connApi.clearDiagnostics(connectionId);
+    if (error) {
+      setState((s) => ({ ...s, error: toMessage(error, 'Failed to clear diagnostics.') }));
+      return false;
+    }
+    return true;
+  }, []);
+
   return {
     ...state,
     refresh,
@@ -253,6 +294,10 @@ export function useConnections(): UseConnectionsReturn {
     deleteModel,
     testConnection,
     setDefaults,
+    refreshModels,
+    loadPresets,
+    loadDiagnostics,
+    clearDiagnostics,
     clearError,
   };
 }

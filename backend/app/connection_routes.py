@@ -21,6 +21,8 @@ from app.connection_repos import (
 from app.adapters import resolve_adapter, supported_adapters, AdapterError
 from app.crypto import is_encryption_available
 from app.utils import now_ms
+from app.diagnostics import DiagnosticsRepo, DiagnosticEvent
+import time as _time
 
 
 router = APIRouter(prefix="/connections", tags=["connections"])
@@ -289,10 +291,24 @@ def test_connection(cid: str, body: TestRequest):
             if not secret:
                 return TestResponse(category="auth_failed", message="No enabled API key for this connection.")
 
+        DiagnosticsRepo.log(conn, DiagnosticEvent(
+            event_type="test_start", connection_id=cid,
+            provider_id=item["adapter"], model=body.model,
+            status="running", message="Connection test started",
+        ))
+        t0 = _time.time()
         result = adapter.test(item["baseUrl"], secret, body.model)
+        duration_ms = int((_time.time() - t0) * 1000)
         # Persist the status on the connection.
         status_str = "connected" if result.category == "ok" else "error"
         ConnectionRepo.update(conn, cid, status=status_str)
+        DiagnosticsRepo.log(conn, DiagnosticEvent(
+            event_type="test_success" if result.category == "ok" else "test_failure",
+            connection_id=cid, provider_id=item["adapter"], model=body.model,
+            status=status_str, duration_ms=duration_ms,
+            message=result.message,
+            details={"statusCode": result.status_code, "category": result.category},
+        ))
         return TestResponse(category=result.category, message=result.message, statusCode=result.status_code)
 
 
@@ -327,3 +343,70 @@ def set_defaults(body: DefaultsBody):
 @router.get("/adapters")
 def list_adapters():
     return {"adapters": supported_adapters()}
+
+
+# --- Provider presets ---
+
+PROVIDER_PRESETS = [
+    {"id": "gemini", "label": "Google Gemini", "adapter": "gemini",
+     "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+     "defaultModel": "gemini-2.0-flash"},
+    {"id": "groq", "label": "GroqCloud", "adapter": "openai_compatible",
+     "baseUrl": "https://api.groq.com/openai",
+     "defaultModel": "llama-3.3-70b-versatile"},
+    {"id": "cerebras", "label": "Cerebras", "adapter": "openai_compatible",
+     "baseUrl": "https://api.cerebras.ai/v1",
+     "defaultModel": "llama3.1-8b"},
+    {"id": "openrouter", "label": "OpenRouter", "adapter": "openai_compatible",
+     "baseUrl": "https://openrouter.ai/api/v1",
+     "defaultModel": "openai/gpt-4o-mini"},
+]
+
+
+@router.get("/presets")
+def list_presets():
+    return {"presets": PROVIDER_PRESETS}
+
+
+# --- Refresh models ---
+
+@router.post("/{cid}/refresh-models")
+def refresh_models(cid: str):
+    with connect() as conn:
+        item = ConnectionRepo.get(conn, cid)
+        if not item:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Connection not found")
+        try:
+            adapter = resolve_adapter(item["adapter"])
+        except ValueError:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown adapter for this connection.")
+        if not is_encryption_available():
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Credential encryption is not configured.")
+        secret, _ = CredentialRepo.select_secret(conn, cid)
+        if not secret:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "No enabled API key for this connection.")
+        DiagnosticsRepo.log(conn, DiagnosticEvent(
+            event_type="refresh_models_start", connection_id=cid,
+            provider_id=item["adapter"], status="running",
+            message="Refreshing model list",
+        ))
+        t0 = _time.time()
+        try:
+            result = adapter.list_models(item["baseUrl"], secret)
+        except AdapterError as exc:
+            duration_ms = int((_time.time() - t0) * 1000)
+            DiagnosticsRepo.log(conn, DiagnosticEvent(
+                event_type="refresh_models_failure", connection_id=cid,
+                provider_id=item["adapter"], status="error", duration_ms=duration_ms,
+                message=exc.message, details={"category": exc.category},
+            ))
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, exc.message)
+        duration_ms = int((_time.time() - t0) * 1000)
+        DiagnosticsRepo.log(conn, DiagnosticEvent(
+            event_type="refresh_models_success", connection_id=cid,
+            provider_id=item["adapter"], status="ok", duration_ms=duration_ms,
+            message=f"Retrieved {len(result.models)} models",
+            details={"count": len(result.models)},
+        ))
+        return {"models": result.models}

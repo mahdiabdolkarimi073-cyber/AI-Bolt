@@ -67,6 +67,12 @@ class TestResult:
         return {"category": self.category, "message": self.message, "statusCode": self.status_code}
 
 
+class ListModelsResult:
+    def __init__(self, *, models: list[str], raw_meta: Optional[dict] = None):
+        self.models = models
+        self.raw_meta = raw_meta or {}
+
+
 class Adapter(Protocol):
     """Protocol every adapter implements."""
 
@@ -80,6 +86,9 @@ class Adapter(Protocol):
 
     def chat(self, base_url: str, api_key: str, model: str, messages: list[dict],
              *, timeout: float = 30.0) -> ChatResult:
+        ...
+
+    def list_models(self, base_url: str, api_key: str, *, timeout: float = 20.0) -> ListModelsResult:
         ...
 
 
@@ -153,7 +162,7 @@ class OpenAICompatibleAdapter:
         try:
             r = httpx.post(
                 self._chat_url(url),
-                headers=self._headers(api_key),
+                headers=self._headers(api_key, _openrouter_headers(base_url)),
                 json={
                     "model": model,
                     "messages": [{"role": "user", "content": "ping"}],
@@ -182,7 +191,7 @@ class OpenAICompatibleAdapter:
         try:
             r = httpx.post(
                 self._chat_url(url),
-                headers=self._headers(api_key),
+                headers=self._headers(api_key, _openrouter_headers(base_url)),
                 json={"model": model, "messages": messages, "temperature": 0.2},
                 **safe_request_kwargs(timeout=timeout),
             )
@@ -214,11 +223,60 @@ class OpenAICompatibleAdapter:
             raw_meta={"provider": "openai_compatible"},
         )
 
-    def _headers(self, api_key: str) -> dict:
-        return {
+    def _headers(self, api_key: str, *, extra: Optional[dict] = None) -> dict:
+        h = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        if extra:
+            h.update(extra)
+        return h
+
+    def list_models(self, base_url: str, api_key: str, *, timeout: float = 20.0) -> ListModelsResult:
+        url = self.validate_config(base_url)
+        if not api_key:
+            raise AdapterError(CATEGORY_AUTH_FAILED, "No API key available for this connection.")
+        models_url = url.rstrip("/")
+        if models_url.endswith("/v1"):
+            models_url = f"{models_url}/models"
+        elif not models_url.endswith("/models"):
+            models_url = f"{models_url}/v1/models"
+        # OpenRouter requires HTTP-Referer and X-Title headers for model listing.
+        extra: dict = {}
+        if "openrouter.ai" in models_url.lower():
+            extra["HTTP-Referer"] = "http://localhost:5173"
+            extra["X-Title"] = "Personal AI IDE"
+        try:
+            r = httpx.get(
+                models_url,
+                headers=self._headers(api_key, extra=extra),
+                **safe_request_kwargs(timeout=timeout),
+            )
+        except httpx.TimeoutException as exc:
+            raise AdapterError(CATEGORY_TIMEOUT, "The model list request timed out.") from exc
+        except httpx.ConnectError as exc:
+            raise AdapterError(CATEGORY_NETWORK_ERROR, "Could not connect to the provider.") from exc
+        except httpx.HTTPError as exc:
+            raise AdapterError(CATEGORY_NETWORK_ERROR, "Network error contacting the provider.") from exc
+        if r.status_code != 200:
+            body = _safe_json(r)
+            cat, msg = _classify_http_error(r.status_code, body)
+            raise AdapterError(cat, msg, status_code=r.status_code)
+        body = _safe_json(r)
+        if not isinstance(body, dict):
+            raise AdapterError(CATEGORY_PROVIDER_ERROR, "Provider returned a malformed model list.")
+        raw_models = body.get("data") or body.get("models") or []
+        if not isinstance(raw_models, list):
+            raise AdapterError(CATEGORY_PROVIDER_ERROR, "Provider returned an unexpected model list format.")
+        model_ids: list[str] = []
+        for item in raw_models:
+            if isinstance(item, str):
+                model_ids.append(item)
+            elif isinstance(item, dict):
+                mid = item.get("id") or item.get("model")
+                if isinstance(mid, str) and mid:
+                    model_ids.append(mid)
+        return ListModelsResult(models=model_ids, raw_meta={"count": len(model_ids)})
 
 
 # --- Google Gemini adapter ---
@@ -327,6 +385,43 @@ class GeminiAdapter:
             raw_meta={"provider": "gemini"},
         )
 
+    def list_models(self, base_url: str, api_key: str, *, timeout: float = 20.0) -> ListModelsResult:
+        url = self.validate_config(base_url)
+        if not api_key:
+            raise AdapterError(CATEGORY_AUTH_FAILED, "No API key available for this connection.")
+        models_url = f"{url.rstrip('/')}/models?key={_q(api_key)}"
+        try:
+            r = httpx.get(
+                models_url,
+                headers={"Content-Type": "application/json"},
+                **safe_request_kwargs(timeout=timeout),
+            )
+        except httpx.TimeoutException as exc:
+            raise AdapterError(CATEGORY_TIMEOUT, "The model list request timed out.") from exc
+        except httpx.ConnectError as exc:
+            raise AdapterError(CATEGORY_NETWORK_ERROR, "Could not connect to the Gemini endpoint.") from exc
+        except httpx.HTTPError as exc:
+            raise AdapterError(CATEGORY_NETWORK_ERROR, "Network error contacting the Gemini endpoint.") from exc
+        if r.status_code != 200:
+            body = _safe_json(r)
+            cat, msg = _classify_http_error(r.status_code, body)
+            raise AdapterError(cat, msg, status_code=r.status_code)
+        body = _safe_json(r)
+        if not isinstance(body, dict):
+            raise AdapterError(CATEGORY_PROVIDER_ERROR, "Gemini returned a malformed model list.")
+        raw_models = body.get("models") or []
+        if not isinstance(raw_models, list):
+            raise AdapterError(CATEGORY_PROVIDER_ERROR, "Gemini returned an unexpected model list format.")
+        model_ids: list[str] = []
+        for item in raw_models:
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("model")
+                if isinstance(name, str) and name:
+                    model_ids.append(name)
+            elif isinstance(item, str):
+                model_ids.append(item)
+        return ListModelsResult(models=model_ids, raw_meta={"count": len(model_ids)})
+
     def _to_gemini_contents(self, messages: list[dict]) -> list[dict]:
         contents: list[dict] = []
         for m in messages:
@@ -386,3 +481,10 @@ def _safe_json(response: httpx.Response) -> Any:
 def _q(value: str) -> str:
     """Minimal query-parameter escaper for the API key."""
     return value.replace("&", "%26").replace("=", "%3D").replace("+", "%2B").replace(" ", "%20")
+
+
+def _openrouter_headers(base_url: Optional[str]) -> dict:
+    """Return extra headers required by OpenRouter."""
+    if base_url and "openrouter.ai" in base_url.lower():
+        return {"HTTP-Referer": "http://localhost:5173", "X-Title": "Personal AI IDE"}
+    return {}

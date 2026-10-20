@@ -21,6 +21,7 @@ from app.connection_routes import router as connection_router
 from app.memory_routes import router as memory_router, kb_router as knowledge_router
 from app.terminal_routes import router as terminal_router
 from app.snapshot_routes import router as snapshot_router
+from app.diagnostics_routes import router as diagnostics_router
 from app.execution import mark_stale_sessions_stopped, process_manager
 
 
@@ -61,6 +62,7 @@ app.include_router(memory_router)
 app.include_router(knowledge_router)
 app.include_router(terminal_router)
 app.include_router(snapshot_router)
+app.include_router(diagnostics_router)
 
 
 @app.get("/health", tags=["system"])

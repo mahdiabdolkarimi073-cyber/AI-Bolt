@@ -146,3 +146,26 @@ export const ADAPTER_DEFAULT_URLS: Record<AdapterId, string> = {
   openai_compatible: 'https://api.groq.com/openai',
   gemini: 'https://generativelanguage.googleapis.com/v1beta',
 };
+
+/** Provider preset for the create-connection form. */
+export interface ProviderPreset {
+  id: string;
+  label: string;
+  adapter: AdapterId;
+  baseUrl: string;
+  defaultModel: string;
+}
+
+/** Diagnostic event from the backend. */
+export interface DiagnosticEvent {
+  id: string;
+  eventType: string;
+  connectionId?: string | null;
+  providerId?: string | null;
+  model?: string | null;
+  status?: string | null;
+  durationMs?: number | null;
+  message: string;
+  details: Record<string, unknown>;
+  createdAt: number;
+}

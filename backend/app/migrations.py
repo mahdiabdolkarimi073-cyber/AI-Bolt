@@ -339,4 +339,27 @@ MIGRATIONS: list[tuple[str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_proposals_status ON change_proposals(status);
         """,
     ),
+    (
+        "0007_connection_diagnostics",
+        """
+        -- Connection diagnostic events. Stores structured, sanitized logs for
+        -- connection lifecycle and AI request events. NEVER contains API keys,
+        -- authorization headers, or raw request/response bodies.
+        CREATE TABLE IF NOT EXISTS connection_diagnostics (
+            id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            connection_id TEXT,
+            provider_id TEXT,
+            model TEXT,
+            status TEXT,
+            duration_ms INTEGER,
+            message TEXT NOT NULL DEFAULT '',
+            details TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_diag_connection ON connection_diagnostics(connection_id);
+        CREATE INDEX IF NOT EXISTS idx_diag_type ON connection_diagnostics(event_type);
+        CREATE INDEX IF NOT EXISTS idx_diag_created ON connection_diagnostics(created_at DESC);
+        """,
+    ),
 ]

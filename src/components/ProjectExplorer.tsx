@@ -72,14 +72,21 @@ function TreeItem({
   const needsLazyLoad = isFolder && open && node.children == null;
 
   useEffect(() => {
-    if (needsLazyLoad) {
-      console.log('[WORKSPACE-DEBUG] folder_expand', {
+    if (!needsLazyLoad) return;
+    if (typeof onExpandFolder !== 'function') {
+      console.error('[WORKSPACE-DEBUG] onExpandFolder is not a function', {
         folderPath: node.id,
-        childrenState: node.children,
         depth,
+        typeofOnExpandFolder: typeof onExpandFolder,
       });
-      onExpandFolder(node.id);
+      return;
     }
+    console.log('[WORKSPACE-DEBUG] folder_expand', {
+      folderPath: node.id,
+      childrenState: node.children,
+      depth,
+    });
+    onExpandFolder(node.id);
   }, [needsLazyLoad, node.id, node.children, onExpandFolder, depth]);
 
   const handleClick = useCallback(() => {

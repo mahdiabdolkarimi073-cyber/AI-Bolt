@@ -14,6 +14,8 @@ import type {
   AddModelInput,
   UpdateModelInput,
   AdapterId,
+  ProviderPreset,
+  DiagnosticEvent,
 } from '@/types/connections';
 
 /**
@@ -159,4 +161,44 @@ export async function setAgentDefaults(connectionId: string | null, model: strin
   if (error) return { data: null, error };
   if (!data) return { data: null, error: { code: 'server', message: 'Empty response from backend.' } };
   return { data, error: null };
+}
+
+// --- Provider presets ---
+
+export async function listPresets(): Promise<ApiResult<ProviderPreset[]>> {
+  const { data, error } = await request<{ presets: ProviderPreset[] }>('/connections/presets');
+  if (error) return { data: null, error };
+  return { data: data?.presets ?? [], error: null };
+}
+
+// --- Refresh models ---
+
+export async function refreshModels(connectionId: string): Promise<ApiResult<string[]>> {
+  const { data, error } = await request<{ models: string[] }>(
+    `/connections/${encodeURIComponent(connectionId)}/refresh-models`,
+    { method: 'POST' },
+  );
+  if (error) return { data: null, error };
+  return { data: data?.models ?? [], error: null };
+}
+
+// --- Diagnostics ---
+
+export async function listDiagnostics(
+  connectionId?: string,
+  limit = 100,
+): Promise<ApiResult<DiagnosticEvent[]>> {
+  const qs = connectionId
+    ? `?connectionId=${encodeURIComponent(connectionId)}&limit=${limit}`
+    : `?limit=${limit}`;
+  const { data, error } = await request<DiagnosticEvent[]>(`/diagnostics${qs}`);
+  if (error) return { data: null, error };
+  return { data: data ?? [], error: null };
+}
+
+export async function clearDiagnostics(connectionId?: string): Promise<ApiResult<void>> {
+  const qs = connectionId ? `?connectionId=${encodeURIComponent(connectionId)}` : '';
+  const { error } = await request<void>(`/diagnostics${qs}`, { method: 'DELETE' });
+  if (error) return { data: null, error };
+  return { data: undefined, error: null };
 }

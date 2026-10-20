@@ -27,6 +27,7 @@ from app.repositories import ConversationRepo, MessageRepo
 from app.connection_repos import ConnectionRepo, CredentialRepo, AgentDefaultsRepo
 from app.adapters import resolve_adapter, AdapterError, CATEGORY_OK
 from app.crypto import is_encryption_available
+from app.diagnostics import DiagnosticsRepo, DiagnosticEvent
 from app.retrieval import retrieve_context, render_context_block, DEFAULT_RETRIEVAL_BUDGET_CHARS
 from app.agent_file_tools import (
     retrieve_project_context,
@@ -298,6 +299,12 @@ def run_agent(body: AgentRunRequest):
             )
 
         # Execute through the adapter.
+        DiagnosticsRepo.log(conn, DiagnosticEvent(
+            event_type="ai_request_start", connection_id=connection["id"],
+            provider_id=connection["adapter"], model=model,
+            status="running", message="AI request started",
+        ))
+        req_t0 = time.time()
         try:
             result = adapter.chat(
                 connection["baseUrl"],
@@ -307,6 +314,13 @@ def run_agent(body: AgentRunRequest):
                 timeout=30.0,
             )
         except AdapterError as exc:
+            req_dur = int((time.time() - req_t0) * 1000)
+            DiagnosticsRepo.log(conn, DiagnosticEvent(
+                event_type="ai_request_failure", connection_id=connection["id"],
+                provider_id=connection["adapter"], model=model,
+                status="error", duration_ms=req_dur,
+                message=exc.message, details={"category": exc.category},
+            ))
             return AgentRunResponse(
                 requestId=request_id,
                 conversationId=body.conversationId,
@@ -318,7 +332,13 @@ def run_agent(body: AgentRunRequest):
                 finishedAt=int(time.time() * 1000),
             )
         except Exception:
-            # Never leak internal exception details.
+            req_dur = int((time.time() - req_t0) * 1000)
+            DiagnosticsRepo.log(conn, DiagnosticEvent(
+                event_type="ai_request_failure", connection_id=connection["id"],
+                provider_id=connection["adapter"], model=model,
+                status="error", duration_ms=req_dur,
+                message="The provider request failed unexpectedly.",
+            ))
             return AgentRunResponse(
                 requestId=request_id,
                 conversationId=body.conversationId,
@@ -329,6 +349,14 @@ def run_agent(body: AgentRunRequest):
                 startedAt=started,
                 finishedAt=int(time.time() * 1000),
             )
+        req_dur = int((time.time() - req_t0) * 1000)
+        DiagnosticsRepo.log(conn, DiagnosticEvent(
+            event_type="ai_request_success", connection_id=connection["id"],
+            provider_id=connection["adapter"], model=model,
+            status="ok", duration_ms=req_dur,
+            message="AI request succeeded",
+            details={"finishReason": result.finish_reason} if result.finish_reason else {},
+        ))
 
         # Persist the assistant message (authoritative path).
         assistant_msg = MessageRepo.append(
