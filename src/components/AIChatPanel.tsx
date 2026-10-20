@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { PanelRightClose, Sparkles, MoreHorizontal, Trash2, AlertCircle, X } from 'lucide-react';
+import { PanelRightClose, Sparkles, MoreHorizontal, Trash2, AlertCircle, X, Activity } from 'lucide-react';
 import { ChatMessage } from './ChatMessage';
 import { ChatComposer } from './ChatComposer';
 import type { ChatMessage as ChatMessageType } from '@/types';
+import type { ProviderExecutionMeta } from '@/types/agent';
 
 interface Props {
   messages: ChatMessageType[];
@@ -21,9 +22,84 @@ interface Props {
   /** Last error message to surface, if any. */
   error?: string | null;
   onDismissError?: () => void;
+  /** Metadata from the most recent provider request, for diagnostics. */
+  lastMeta?: ProviderExecutionMeta;
 }
 
-export function AIChatPanel({ messages, onSend, busy, onStop, onCollapse, connectionLabel, modelLabel, connected, simulatedIds, error, onDismissError }: Props) {
+function DiagnosticBar({ meta }: { meta: ProviderExecutionMeta }) {
+  const [expanded, setExpanded] = useState(false);
+  const substituted = meta.modelSubstituted === true;
+  const confirmed = meta.providerActualModelConfirmed === true;
+  const reportedModel = meta.providerReportedModel ?? null;
+  const usage = meta.usage as Record<string, number> | undefined;
+  const usageStr = usage
+    ? `tokens: ${usage.promptTokenCount ?? usage.prompt_tokens ?? '?'}→${usage.candidatesTokenCount ?? usage.completion_tokens ?? '?'} (${usage.totalTokenCount ?? usage.total_tokens ?? '?'})`
+    : null;
+
+  return (
+    <div className="border-b border-surface-700 bg-surface-900/60 px-3 py-1.5">
+      <button
+        onClick={() => setExpanded((e) => !e)}
+        className="flex w-full items-center gap-1.5 text-2xs text-surface-300 transition-colors hover:text-gray-200"
+      >
+        <Activity size={11} className={substituted ? 'text-warning-400' : 'text-accent-400'} />
+        <span className="font-mono">
+          {meta.model ?? '?'}
+          {substituted && <span className="text-warning-400"> (substituted)</span>}
+        </span>
+        <span className="ml-auto truncate text-surface-400">
+          {reportedModel
+            ? `provider: ${reportedModel}`
+            : confirmed === false
+              ? 'actual model unconfirmed'
+              : ''}
+        </span>
+      </button>
+      {expanded && (
+        <div className="mt-1.5 space-y-1 font-mono text-2xs text-surface-300">
+          <div className="flex justify-between gap-2">
+            <span className="text-surface-400">requestId</span>
+            <span className="truncate text-gray-300">{meta.requestId ?? '—'}</span>
+          </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-surface-400">selectedModel</span>
+            <span className="truncate text-gray-300">{meta.selectedModel ?? '—'}</span>
+          </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-surface-400">modelSent</span>
+            <span className="truncate text-gray-300">{meta.model ?? '—'}</span>
+          </div>
+          <div className="flex justify-between gap-2">
+            <span className="text-surface-400">providerModel</span>
+            <span className="truncate text-gray-300">
+              {reportedModel ?? (confirmed === false ? '(unconfirmed)' : '—')}
+            </span>
+          </div>
+          {meta.providerResponseId && (
+            <div className="flex justify-between gap-2">
+              <span className="text-surface-400">responseId</span>
+              <span className="truncate text-gray-300">{meta.providerResponseId}</span>
+            </div>
+          )}
+          {usageStr && (
+            <div className="flex justify-between gap-2">
+              <span className="text-surface-400">usage</span>
+              <span className="text-gray-300">{usageStr}</span>
+            </div>
+          )}
+          <div className="flex justify-between gap-2">
+            <span className="text-surface-400">status</span>
+            <span className={meta.simulated ? 'text-warning-400' : 'text-success-500'}>
+              {meta.simulated ? 'simulated' : 'real'}
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function AIChatPanel({ messages, onSend, busy, onStop, onCollapse, connectionLabel, modelLabel, connected, simulatedIds, error, onDismissError, lastMeta }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -78,6 +154,8 @@ export function AIChatPanel({ messages, onSend, busy, onStop, onCollapse, connec
           </button>
         </div>
       </div>
+
+      {lastMeta && !lastMeta.simulated && <DiagnosticBar meta={lastMeta} />}
 
       {/* messages */}
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">

@@ -31,6 +31,7 @@ class AdapterError(Exception):
     def __init__(self, category: str, message: str, *, status_code: Optional[int] = None):
         super().__init__(message)
         self.category = category
+        self.message = message
         self.status_code = status_code
 
 
@@ -220,7 +221,7 @@ class OpenAICompatibleAdapter:
             content=content,
             finish_reason=first.get("finish_reason") if isinstance(first, dict) else None,
             usage=body.get("usage") if isinstance(body.get("usage"), dict) else None,
-            raw_meta={"provider": "openai_compatible"},
+            raw_meta={"provider": "openai_compatible", "model": body.get("model")} if isinstance(body.get("model"), str) else {"provider": "openai_compatible"},
         )
 
     def _headers(self, api_key: str, *, extra: Optional[dict] = None) -> dict:
@@ -378,11 +379,21 @@ class GeminiAdapter:
             raise AdapterError(CATEGORY_PROVIDER_ERROR, "Gemini response had no content.")
         finish = first.get("finishReason") if isinstance(first, dict) else None
         usage = body.get("usageMetadata") if isinstance(body.get("usageMetadata"), dict) else None
+        # Preserve provider-reported metadata so the caller can verify which
+        # model actually executed. modelVersion is Google's authoritative
+        # actual-model field; responseId uniquely identifies the request.
+        model_version = body.get("modelVersion") if isinstance(body.get("modelVersion"), str) else None
+        response_id = body.get("responseId") if isinstance(body.get("responseId"), str) else None
+        raw_meta: dict = {"provider": "gemini"}
+        if model_version:
+            raw_meta["modelVersion"] = model_version
+        if response_id:
+            raw_meta["responseId"] = response_id
         return ChatResult(
             content=content,
             finish_reason=finish,
             usage=usage,
-            raw_meta={"provider": "gemini"},
+            raw_meta=raw_meta,
         )
 
     def list_models(self, base_url: str, api_key: str, *, timeout: float = 20.0) -> ListModelsResult:

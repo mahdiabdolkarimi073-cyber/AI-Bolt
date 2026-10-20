@@ -93,6 +93,18 @@ export interface ProviderExecutionMeta {
   usage?: TokenUsage;
   /** Provider-reported finish reason, when available. */
   finishReason?: string;
+  /** Backend-generated request ID for log correlation. */
+  requestId?: string;
+  /** The model the frontend selected (before any backend resolution). */
+  selectedModel?: string | null;
+  /** True if the backend substituted the selected model with a connection default. */
+  modelSubstituted?: boolean;
+  /** The model the provider reported it actually executed, when available. */
+  providerReportedModel?: string | null;
+  /** The provider's unique response id, when available. */
+  providerResponseId?: string | null;
+  /** True only when providerReportedModel is a trustworthy actual-version field. */
+  providerActualModelConfirmed?: boolean;
 }
 
 export interface TokenUsage {

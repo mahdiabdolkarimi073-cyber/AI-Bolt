@@ -6,6 +6,7 @@ import { getAgentRuntime } from '@/services/agentService';
 import { getRepositories } from '@/services/index';
 import { runAgentViaBackend } from '@/services/agentBackend';
 import { apiErrorToAgentError } from '@/types/agent';
+import type { ProviderExecutionMeta } from '@/types/agent';
 
 /**
  * React hook that bridges the Agent runtime to the chat UI.
@@ -49,6 +50,8 @@ export interface UseAgentChatReturn extends AgentChatState {
   stop: () => void;
   refresh: (conversationIdOverride?: string) => Promise<void>;
   clearError: () => void;
+  /** Metadata from the most recent completed provider request, for diagnostics. */
+  lastMeta?: import('@/types/agent').ProviderExecutionMeta;
 }
 
 export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
@@ -63,6 +66,7 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
     lastError: null,
     lastSimulated: false,
   });
+  const [lastMeta, setLastMeta] = useState<ProviderExecutionMeta | undefined>(undefined);
   const controllerRef = useRef<AbortController | null>(null);
   const reqCounter = useRef(0);
 
@@ -107,6 +111,12 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
       try {
         let result: AgentResult;
         if (config.backendEnabled) {
+          // Log a frontend diagnostic entry so requests can be correlated with
+          // backend logs using the same requestId.
+          console.info(
+            `[agent] requestId=${requestId} conn=${connectionId ?? '(default)'} ` +
+            `model=${model || '(empty)'} provider=${providerId}`,
+          );
           const { data, error } = await runAgentViaBackend({
             conversationId: cid,
             message: trimmed,
@@ -143,6 +153,7 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
 
         const errorMsg = result.error?.message ?? null;
         const simulated = result.meta?.simulated === true || result.assistantMessage?.simulated === true;
+        setLastMeta(result.meta);
         setState((s) => ({
           ...s,
           busy: false,
@@ -175,5 +186,5 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
     setState((s) => ({ ...s, lastError: null }));
   }, []);
 
-  return { ...state, send, stop, refresh, clearError };
+  return { ...state, send, stop, refresh, clearError, lastMeta };
 }

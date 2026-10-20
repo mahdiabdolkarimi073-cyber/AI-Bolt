@@ -405,6 +405,7 @@ export function AppShell() {
                   simulatedIds={simulatedIds}
                   error={agent.lastError}
                   onDismissError={agent.clearError}
+                  lastMeta={agent.lastMeta}
                 />
               </div>
             ) : (

@@ -28,7 +28,20 @@ interface AgentRunPayload {
   userMessage?: { id: string; conversationId: string; role: string; content: string; createdAt: number };
   assistantMessage?: { id: string; conversationId: string; role: string; content: string; createdAt: number };
   error?: { code: string; message: string };
-  meta?: { providerId: string; connectionId?: string; model?: string; simulated?: boolean; finishReason?: string; usage?: unknown };
+  meta?: {
+    providerId: string;
+    connectionId?: string;
+    model?: string;
+    simulated?: boolean;
+    finishReason?: string;
+    usage?: unknown;
+    requestId?: string;
+    selectedModel?: string | null;
+    modelSubstituted?: boolean;
+    providerReportedModel?: string | null;
+    providerResponseId?: string | null;
+    providerActualModelConfirmed?: boolean;
+  };
   retrieval?: { items: RetrievedContextItem[]; chars: number };
   startedAt: number;
   finishedAt: number;
@@ -82,6 +95,12 @@ function toAgentResult(p: AgentRunPayload): AgentResult {
           model: p.meta.model,
           simulated: p.meta.simulated,
           finishReason: p.meta.finishReason,
+          requestId: p.meta.requestId,
+          selectedModel: p.meta.selectedModel,
+          modelSubstituted: p.meta.modelSubstituted,
+          providerReportedModel: p.meta.providerReportedModel,
+          providerResponseId: p.meta.providerResponseId,
+          providerActualModelConfirmed: p.meta.providerActualModelConfirmed,
         }
       : undefined,
     retrieval: p.retrieval ? (normalizeRetrieval(p.retrieval) as RetrievalMeta) : undefined,

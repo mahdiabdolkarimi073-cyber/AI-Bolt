@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     allow_dev_key: bool = True
     env: str = "development"
 
+    # Timeout (seconds) for AI provider chat requests. Model generation can
+    # take longer than a simple API call, so this defaults to 120s. Override
+    # with PAIDE_AGENT_TIMEOUT_SECONDS.
+    agent_timeout_seconds: float = 120.0
+
 
 settings = Settings()
 
