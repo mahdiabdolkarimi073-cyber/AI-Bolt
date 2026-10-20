@@ -10,6 +10,9 @@ import {
   Cpu,
   ShieldAlert,
   CircleDot,
+  RefreshCw,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import { Button } from './ui/Button';
 import { useConnections } from '@/hooks/useConnections';
@@ -21,6 +24,14 @@ import {
   type AdapterId,
   type ConnectionTestResult,
 } from '@/types/connections';
+
+/** Suggested Gemini model IDs the user can pick from when creating a connection. */
+const GEMINI_MODEL_SUGGESTIONS = [
+  'gemini-2.5-flash',
+  'gemini-2.5-pro',
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
+];
 
 /**
  * AI Connections management panel, rendered inside the existing Settings dialog.
@@ -65,7 +76,7 @@ export function ConnectionsPanel() {
       <div className="flex items-center justify-between">
         <div className="text-2xs text-surface-300">
           {c.connections.length === 0
-            ? 'No connections configured yet.'
+            ? 'No connections configured yet. Click "Add connection" to set up Google Gemini.'
             : `${c.connections.length} connection${c.connections.length === 1 ? '' : 's'}`}
         </div>
         <Button variant="primary" size="sm" onClick={() => setShowCreate(true)} disabled={showCreate}>
@@ -76,9 +87,25 @@ export function ConnectionsPanel() {
       {showCreate && (
         <CreateConnectionForm
           onCancel={() => setShowCreate(false)}
-          onCreate={async (input) => {
-            const ok = await c.createConnection(input);
-            if (ok) setShowCreate(false);
+          onSubmit={async (input) => {
+            // Full flow: create connection, then add key, then add model, then set defaults.
+            const conn = await c.createConnection({
+              displayName: input.displayName,
+              adapter: input.adapter,
+              providerLabel: input.providerLabel,
+              baseUrl: input.baseUrl,
+            });
+            if (!conn) return false;
+            if (input.apiKey) {
+              const keyOk = await c.addCredential(conn.id, { secret: input.apiKey, isPrimary: true });
+              if (!keyOk) return false;
+            }
+            if (input.modelId) {
+              const modelOk = await c.addModel(conn.id, { modelId: input.modelId, isDefault: true });
+              if (!modelOk) return false;
+              await c.setDefaults(conn.id, input.modelId);
+            }
+            return true;
           }}
         />
       )}
@@ -98,9 +125,11 @@ export function ConnectionsPanel() {
             onAddCredential={(input) => c.addCredential(conn.id, input)}
             onUpdateCredential={(credId, input) => c.updateCredential(conn.id, credId, input)}
             onDeleteCredential={(credId) => c.deleteCredential(conn.id, credId)}
+            onReplaceCredential={(credId, secret) => c.replaceCredential(conn.id, credId, secret)}
             onAddModel={(input) => c.addModel(conn.id, input)}
             onUpdateModel={(modelId, input) => c.updateModel(conn.id, modelId, input)}
             onDeleteModel={(modelId) => c.deleteModel(conn.id, modelId)}
+            onRefreshModels={() => c.refreshModels(conn.id)}
           />
         ))}
       </div>
@@ -119,7 +148,6 @@ function BackendUnavailableNotice() {
         start the local FastAPI backend and set <code className="font-mono text-warning-100">VITE_API_BASE_URL</code> in
         your <code className="font-mono text-warning-100">.env</code> to its address (e.g.
         <code className="font-mono text-warning-100"> http://localhost:8000</code>).
-        See <code className="font-mono text-warning-100">docs/provider-management.md</code> for setup steps.
       </p>
     </div>
   );
@@ -139,9 +167,11 @@ interface ConnectionCardProps {
   onAddCredential: (input: { secret: string; label?: string; isPrimary?: boolean }) => Promise<boolean>;
   onUpdateCredential: (credId: string, input: { label?: string | null; enabled?: boolean; isPrimary?: boolean }) => Promise<boolean>;
   onDeleteCredential: (credId: string) => Promise<boolean>;
+  onReplaceCredential: (credId: string, secret: string) => Promise<boolean>;
   onAddModel: (input: { modelId: string; label?: string; isDefault?: boolean }) => Promise<boolean>;
   onUpdateModel: (modelId: string, input: { label?: string | null; enabled?: boolean; isDefault?: boolean }) => Promise<boolean>;
   onDeleteModel: (modelId: string) => Promise<boolean>;
+  onRefreshModels: () => Promise<string[] | null>;
 }
 
 function ConnectionCard(props: ConnectionCardProps) {
@@ -153,10 +183,12 @@ function ConnectionCard(props: ConnectionCardProps) {
     onAddCredential,
     onUpdateCredential,
     onDeleteCredential,
+    onReplaceCredential,
     onAddModel,
     onUpdateModel,
     onDeleteModel,
     onSetDefault,
+    onRefreshModels,
   } = props;
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState(conn.displayName);
@@ -165,6 +197,7 @@ function ConnectionCard(props: ConnectionCardProps) {
   const [testModel, setTestModel] = useState(conn.defaultModel ?? conn.models[0]?.modelId ?? '');
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
+  const [refreshingModels, setRefreshingModels] = useState(false);
 
   const statusColor =
     conn.status === 'connected'
@@ -180,6 +213,12 @@ function ConnectionCard(props: ConnectionCardProps) {
     const r = await props.onTest(testModel);
     setTestResult(r);
     setTesting(false);
+  }
+
+  async function handleRefreshModels() {
+    setRefreshingModels(true);
+    await onRefreshModels();
+    setRefreshingModels(false);
   }
 
   return (
@@ -198,7 +237,7 @@ function ConnectionCard(props: ConnectionCardProps) {
               )}
             </div>
             <div className="mt-0.5 truncate text-2xs text-surface-300">
-              {ADAPTER_LABELS[conn.adapter]} · {conn.baseUrl || 'no base URL'} · {conn.models.length} model(s) · {conn.credentials.length} key(s)
+              {ADAPTER_LABELS[conn.adapter]} · {conn.models.length} model(s) · {conn.credentials.length} key(s)
             </div>
           </div>
         </button>
@@ -290,6 +329,7 @@ function ConnectionCard(props: ConnectionCardProps) {
             onAddCredential={onAddCredential}
             onUpdateCredential={onUpdateCredential}
             onDeleteCredential={onDeleteCredential}
+            onReplaceCredential={onReplaceCredential}
           />
 
           {/* Models */}
@@ -300,6 +340,8 @@ function ConnectionCard(props: ConnectionCardProps) {
             onUpdateModel={onUpdateModel}
             onDeleteModel={onDeleteModel}
             onSetDefault={onSetDefault}
+            onRefreshModels={handleRefreshModels}
+            refreshingModels={refreshingModels}
           />
 
           {/* Danger zone */}
@@ -329,21 +371,43 @@ interface CredentialsSectionProps {
   onAddCredential: (input: { secret: string; label?: string; isPrimary?: boolean }) => Promise<boolean>;
   onUpdateCredential: (credId: string, input: { label?: string | null; enabled?: boolean; isPrimary?: boolean }) => Promise<boolean>;
   onDeleteCredential: (credId: string) => Promise<boolean>;
+  onReplaceCredential: (credId: string, secret: string) => Promise<boolean>;
 }
 
-interface ModelsSectionProps {
-  conn: ApiConnectionDetail;
-  isDefault: boolean;
-  onAddModel: (input: { modelId: string; label?: string; isDefault?: boolean }) => Promise<boolean>;
-  onUpdateModel: (modelId: string, input: { label?: string | null; enabled?: boolean; isDefault?: boolean }) => Promise<boolean>;
-  onDeleteModel: (modelId: string) => Promise<boolean>;
-  onSetDefault: (model: string) => Promise<boolean>;
-}
-
-function CredentialsSection({ conn, onAddCredential, onUpdateCredential, onDeleteCredential }: CredentialsSectionProps) {
+function CredentialsSection({ conn, onAddCredential, onUpdateCredential, onDeleteCredential, onReplaceCredential }: CredentialsSectionProps) {
   const [secret, setSecret] = useState('');
   const [label, setLabel] = useState('');
   const [adding, setAdding] = useState(false);
+  const [savingKey, setSavingKey] = useState(false);
+  const [showSecret, setShowSecret] = useState(false);
+  const [replacingId, setReplacingId] = useState<string | null>(null);
+  const [replaceSecret, setReplaceSecret] = useState('');
+  const [showReplace, setShowReplace] = useState(false);
+
+  async function handleSaveKey() {
+    if (!secret.trim()) return;
+    setSavingKey(true);
+    const ok = await onAddCredential({ secret: secret.trim(), label: label.trim() || undefined, isPrimary: conn.credentials.length === 0 });
+    setSavingKey(false);
+    if (ok) {
+      setSecret('');
+      setLabel('');
+      setAdding(false);
+      setShowSecret(false);
+    }
+  }
+
+  async function handleReplace() {
+    if (!replacingId || !replaceSecret.trim()) return;
+    setSavingKey(true);
+    const ok = await onReplaceCredential(replacingId, replaceSecret.trim());
+    setSavingKey(false);
+    if (ok) {
+      setReplacingId(null);
+      setReplaceSecret('');
+      setShowReplace(false);
+    }
+  }
 
   return (
     <div className="rounded-md bg-surface-850 p-2">
@@ -356,65 +420,124 @@ function CredentialsSection({ conn, onAddCredential, onUpdateCredential, onDelet
 
       <div className="mt-2 space-y-1.5">
         {conn.credentials.length === 0 && (
-          <div className="text-2xs text-surface-400">No keys added yet.</div>
+          <div className="rounded bg-warning-500/10 px-2 py-1.5 text-2xs text-warning-300">
+            No API key added yet. Add one below to enable this connection.
+          </div>
         )}
         {conn.credentials.map((cred) => (
-          <div key={cred.id} className="flex items-center gap-2 rounded bg-surface-800 px-2 py-1.5">
-            <CircleDot size={11} className={cred.enabled ? 'text-success-400' : 'text-surface-500'} />
-            <div className="min-w-0 flex-1">
-              <div className="truncate font-mono text-2xs text-gray-200">{cred.keyMask}</div>
-              <div className="text-[10px] text-surface-400">
-                {cred.label || 'no label'} {cred.isPrimary && '· primary'}
+          <div key={cred.id} className="space-y-1.5 rounded bg-surface-800 px-2 py-1.5">
+            <div className="flex items-center gap-2">
+              <CircleDot size={11} className={cred.enabled ? 'text-success-400' : 'text-surface-500'} />
+              <div className="min-w-0 flex-1">
+                <div className="truncate font-mono text-2xs text-gray-200">{cred.keyMask}</div>
+                <div className="text-[10px] text-surface-400">
+                  {cred.label || 'no label'} {cred.isPrimary && '· primary'}
+                </div>
               </div>
+              <button
+                onClick={() => onUpdateCredential(cred.id, { isPrimary: true })}
+                className={`rounded px-1.5 py-0.5 text-[10px] ${cred.isPrimary ? 'text-accent-300' : 'text-surface-300 hover:bg-surface-750'}`}
+                disabled={cred.isPrimary}
+              >
+                {cred.isPrimary ? 'Primary' : 'Set primary'}
+              </button>
+              <button
+                onClick={() => onUpdateCredential(cred.id, { enabled: !cred.enabled })}
+                className="rounded px-1.5 py-0.5 text-[10px] text-surface-300 hover:bg-surface-750"
+              >
+                {cred.enabled ? 'Disable' : 'Enable'}
+              </button>
+              <button
+                onClick={() => {
+                  if (confirm('Remove this API key?')) onDeleteCredential(cred.id);
+                }}
+                className="rounded px-1.5 py-0.5 text-[10px] text-error-300 hover:bg-error-500/10"
+              >
+                <Trash2 size={11} />
+              </button>
             </div>
-            <button
-              onClick={() => onUpdateCredential(cred.id, { isPrimary: true })}
-              className={`rounded px-1.5 py-0.5 text-[10px] ${cred.isPrimary ? 'text-accent-300' : 'text-surface-300 hover:bg-surface-750'}`}
-              disabled={cred.isPrimary}
-            >
-              {cred.isPrimary ? 'Primary' : 'Set primary'}
-            </button>
-            <button
-              onClick={() => onUpdateCredential(cred.id, { enabled: !cred.enabled })}
-              className="rounded px-1.5 py-0.5 text-[10px] text-surface-300 hover:bg-surface-750"
-            >
-              {cred.enabled ? 'Disable' : 'Enable'}
-            </button>
-            <button
-              onClick={() => {
-                if (confirm('Remove this API key?')) onDeleteCredential(cred.id);
-              }}
-              className="rounded px-1.5 py-0.5 text-[10px] text-error-300 hover:bg-error-500/10"
-            >
-              <Trash2 size={11} />
-            </button>
+            {/* Replace key action */}
+            {replacingId === cred.id ? (
+              <div className="space-y-1.5 rounded bg-surface-850 p-1.5">
+                <div className="relative">
+                  <FieldInput
+                    label="New API key"
+                    value={replaceSecret}
+                    onChange={setReplaceSecret}
+                    placeholder="Enter new key to replace this one"
+                    mono
+                    password={!showReplace}
+                  />
+                  <button
+                    onClick={() => setShowReplace((s) => !s)}
+                    className="absolute right-2 top-6 text-surface-400 hover:text-gray-200"
+                    type="button"
+                  >
+                    {showReplace ? <EyeOff size={12} /> : <Eye size={12} />}
+                  </button>
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={handleReplace}
+                    disabled={savingKey || !replaceSecret.trim()}
+                  >
+                    {savingKey && <Loader2 size={12} className="mr-1 animate-spin" />}
+                    Replace key
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => { setReplacingId(null); setReplaceSecret(''); setShowReplace(false); }}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={() => { setReplacingId(cred.id); setReplaceSecret(''); setShowReplace(false); }}
+                className="flex items-center gap-1 text-[10px] text-accent-400 hover:text-accent-300"
+              >
+                <RefreshCw size={10} /> Replace key
+              </button>
+            )}
           </div>
         ))}
       </div>
 
       {adding ? (
         <div className="mt-2 space-y-1.5">
-          <FieldInput label="New API key" value={secret} onChange={setSecret} placeholder="sk-..." mono password />
+          <div className="relative">
+            <FieldInput
+              label="New API key"
+              value={secret}
+              onChange={setSecret}
+              placeholder="AIza..."
+              mono
+              password={!showSecret}
+            />
+            <button
+              onClick={() => setShowSecret((s) => !s)}
+              className="absolute right-2 top-6 text-surface-400 hover:text-gray-200"
+              type="button"
+            >
+              {showSecret ? <EyeOff size={12} /> : <Eye size={12} />}
+            </button>
+          </div>
           <FieldInput label="Label (optional)" value={label} onChange={setLabel} placeholder="e.g. personal key" />
           <div className="flex gap-2">
             <Button
               variant="primary"
               size="sm"
-              onClick={async () => {
-                if (!secret.trim()) return;
-                setAdding(true);
-                const ok = await onAddCredential({ secret: secret.trim(), label: label.trim() || undefined });
-                setAdding(false);
-                if (ok) {
-                  setSecret('');
-                  setLabel('');
-                }
-              }}
-              disabled={!secret.trim()}
+              onClick={handleSaveKey}
+              disabled={savingKey || !secret.trim()}
             >
+              {savingKey && <Loader2 size={12} className="mr-1 animate-spin" />}
               Save key
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => { setAdding(false); setSecret(''); setLabel(''); }}>
+            <Button variant="ghost" size="sm" onClick={() => { setAdding(false); setSecret(''); setLabel(''); setShowSecret(false); }}>
               Cancel
             </Button>
           </div>
@@ -430,18 +553,41 @@ function CredentialsSection({ conn, onAddCredential, onUpdateCredential, onDelet
 
 // --- Models section ---
 
-function ModelsSection({ conn, isDefault, onAddModel, onUpdateModel, onDeleteModel, onSetDefault }: ModelsSectionProps) {
+interface ModelsSectionProps {
+  conn: ApiConnectionDetail;
+  isDefault: boolean;
+  onAddModel: (input: { modelId: string; label?: string; isDefault?: boolean }) => Promise<boolean>;
+  onUpdateModel: (modelId: string, input: { label?: string | null; enabled?: boolean; isDefault?: boolean }) => Promise<boolean>;
+  onDeleteModel: (modelId: string) => Promise<boolean>;
+  onSetDefault: (model: string) => Promise<boolean>;
+  onRefreshModels: () => Promise<void>;
+  refreshingModels: boolean;
+}
+
+function ModelsSection({ conn, isDefault, onAddModel, onUpdateModel, onDeleteModel, onSetDefault, onRefreshModels, refreshingModels }: ModelsSectionProps) {
   const [modelId, setModelId] = useState('');
   const [modelLabel, setModelLabel] = useState('');
   const [adding, setAdding] = useState(false);
 
   return (
     <div className="rounded-md bg-surface-850 p-2">
-      <div className="flex items-center gap-1.5 text-2xs font-semibold text-gray-200">
-        <Cpu size={13} /> Models
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5 text-2xs font-semibold text-gray-200">
+          <Cpu size={13} /> Models
+        </div>
+        {conn.adapter === 'gemini' && conn.hasKey && (
+          <button
+            onClick={onRefreshModels}
+            disabled={refreshingModels}
+            className="flex items-center gap-1 text-[10px] text-accent-400 hover:text-accent-300 disabled:text-surface-400"
+          >
+            {refreshingModels ? <Loader2 size={10} className="animate-spin" /> : <RefreshCw size={10} />}
+            Fetch from API
+          </button>
+        )}
       </div>
       <p className="mt-1 text-[10px] text-surface-400">
-        Manually enter model IDs. Capabilities are unknown unless the provider reports them.
+        Enter a model ID manually or fetch available models from the provider.
       </p>
 
       <div className="mt-2 space-y-1.5">
@@ -480,7 +626,24 @@ function ModelsSection({ conn, isDefault, onAddModel, onUpdateModel, onDeleteMod
 
       {adding ? (
         <div className="mt-2 space-y-1.5">
-          <FieldInput label="Model ID" value={modelId} onChange={setModelId} placeholder="e.g. gemini-2.0-flash" mono />
+          {conn.adapter === 'gemini' && (
+            <div className="flex flex-wrap gap-1">
+              {GEMINI_MODEL_SUGGESTIONS.map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setModelId(m)}
+                  className={`rounded px-1.5 py-0.5 font-mono text-[10px] transition-colors ${
+                    modelId === m
+                      ? 'bg-accent-500/20 text-accent-300'
+                      : 'bg-surface-800 text-surface-300 hover:bg-surface-750'
+                  }`}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          )}
+          <FieldInput label="Model ID" value={modelId} onChange={setModelId} placeholder="e.g. gemini-2.5-flash" mono />
           <FieldInput label="Label (optional)" value={modelLabel} onChange={setModelLabel} />
           <div className="flex gap-2">
             <Button
@@ -489,7 +652,7 @@ function ModelsSection({ conn, isDefault, onAddModel, onUpdateModel, onDeleteMod
               onClick={async () => {
                 if (!modelId.trim()) return;
                 const ok = await onAddModel({ modelId: modelId.trim(), label: modelLabel.trim() || undefined });
-                if (ok) { setModelId(''); setModelLabel(''); }
+                if (ok) { setModelId(''); setModelLabel(''); setAdding(false); }
               }}
               disabled={!modelId.trim()}
             >
@@ -509,17 +672,69 @@ function ModelsSection({ conn, isDefault, onAddModel, onUpdateModel, onDeleteMod
 
 // --- Create connection form ---
 
-function CreateConnectionForm({ onCancel, onCreate }: { onCancel: () => void; onCreate: (input: { displayName: string; adapter: AdapterId; providerLabel?: string; baseUrl?: string }) => Promise<void> }) {
+interface CreateConnectionInput {
+  displayName: string;
+  adapter: AdapterId;
+  providerLabel?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  modelId?: string;
+}
+
+interface CreateConnectionFormProps {
+  onCancel: () => void;
+  onSubmit: (input: CreateConnectionInput) => Promise<boolean>;
+}
+
+function CreateConnectionForm({ onCancel, onSubmit }: CreateConnectionFormProps) {
   const [displayName, setDisplayName] = useState('');
-  const [adapter, setAdapter] = useState<AdapterId>('openai_compatible');
+  const [adapter, setAdapter] = useState<AdapterId>('gemini');
   const [providerLabel, setProviderLabel] = useState('');
-  const [baseUrl, setBaseUrl] = useState(ADAPTER_DEFAULT_URLS.openai_compatible);
+  const [baseUrl, setBaseUrl] = useState(ADAPTER_DEFAULT_URLS.gemini);
+  const [apiKey, setApiKey] = useState('');
+  const [modelId, setModelId] = useState('gemini-2.5-flash');
+  const [showKey, setShowKey] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const isGemini = adapter === 'gemini';
+
+  async function handleSubmit() {
+    if (!displayName.trim() || !apiKey.trim() || !modelId.trim()) return;
+    setBusy(true);
+    setStatusMsg('Creating connection…');
+    setErrorMsg(null);
+    try {
+      setStatusMsg('Saving API key and model…');
+      const ok = await onSubmit({
+        displayName: displayName.trim(),
+        adapter,
+        providerLabel: providerLabel.trim() || undefined,
+        baseUrl: baseUrl.trim() || undefined,
+        apiKey: apiKey.trim(),
+        modelId: modelId.trim(),
+      });
+      if (ok) {
+        setStatusMsg(null);
+      } else {
+        setStatusMsg(null);
+        setErrorMsg('Could not complete setup. Check the error above and try again.');
+      }
+    } catch {
+      setStatusMsg(null);
+      setErrorMsg('An unexpected error occurred.');
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <div className="space-y-2 rounded-md border border-accent-500/30 bg-surface-850 p-2.5">
-      <div className="text-2xs font-semibold text-gray-200">New connection</div>
-      <FieldInput label="Display name" value={displayName} onChange={setDisplayName} placeholder="e.g. My Groq key" />
+      <div className="text-2xs font-semibold text-gray-200">New Gemini connection</div>
+
+      <FieldInput label="Display name" value={displayName} onChange={setDisplayName} placeholder="e.g. My Gemini key" />
+
       <div className="space-y-1">
         <label className="text-[10px] text-surface-300">Adapter / protocol</label>
         <select
@@ -536,26 +751,78 @@ function CreateConnectionForm({ onCancel, onCreate }: { onCancel: () => void; on
           ))}
         </select>
       </div>
-      <FieldInput label="Provider label (optional)" value={providerLabel} onChange={setProviderLabel} placeholder="e.g. GroqCloud" />
+
       <FieldInput label="Base URL" value={baseUrl} onChange={setBaseUrl} mono placeholder={ADAPTER_DEFAULT_URLS[adapter]} />
+
+      {/* API Key */}
+      <div className="space-y-1">
+        <label className="text-[10px] text-surface-300">
+          API key {isGemini && '(get one at aistudio.google.com/apikey)'}
+        </label>
+        <div className="relative">
+          <input
+            type={showKey ? 'text' : 'password'}
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder="AIza..."
+            className="w-full rounded-md border border-surface-600 bg-surface-800 px-2 py-1 pr-7 font-mono text-2xs text-gray-100 placeholder:text-surface-400 focus:border-accent-500/50 focus:outline-none"
+          />
+          <button
+            onClick={() => setShowKey((s) => !s)}
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-surface-400 hover:text-gray-200"
+            type="button"
+          >
+            {showKey ? <EyeOff size={12} /> : <Eye size={12} />}
+          </button>
+        </div>
+        <p className="text-[10px] text-surface-400">
+          Encrypted on the backend. Never shown again after saving.
+        </p>
+      </div>
+
+      {/* Model */}
+      <div className="space-y-1">
+        <label className="text-[10px] text-surface-300">Model</label>
+        {isGemini && (
+          <div className="flex flex-wrap gap-1">
+            {GEMINI_MODEL_SUGGESTIONS.map((m) => (
+              <button
+                key={m}
+                onClick={() => setModelId(m)}
+                className={`rounded px-1.5 py-0.5 font-mono text-[10px] transition-colors ${
+                  modelId === m
+                    ? 'bg-accent-500/20 text-accent-300'
+                    : 'bg-surface-800 text-surface-300 hover:bg-surface-750'
+                }`}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+        )}
+        <FieldInput label="Model ID" value={modelId} onChange={setModelId} placeholder="e.g. gemini-2.5-flash" mono />
+      </div>
+
+      {statusMsg && (
+        <div className="flex items-center gap-2 text-2xs text-accent-300">
+          <Loader2 size={12} className="animate-spin" /> {statusMsg}
+        </div>
+      )}
+      {errorMsg && (
+        <div className="flex items-start gap-2 rounded px-2 py-1.5 text-2xs text-error-300 bg-error-500/10">
+          <AlertCircle size={12} className="mt-0.5 shrink-0" /> {errorMsg}
+        </div>
+      )}
+
       <div className="flex gap-2 pt-1">
         <Button
           variant="primary"
           size="sm"
-          disabled={busy || !displayName.trim()}
-          onClick={async () => {
-            setBusy(true);
-            await onCreate({
-              displayName: displayName.trim(),
-              adapter,
-              providerLabel: providerLabel.trim() || undefined,
-              baseUrl: baseUrl.trim() || undefined,
-            });
-            setBusy(false);
-          }}
+          disabled={busy || !displayName.trim() || !apiKey.trim() || !modelId.trim()}
+          onClick={handleSubmit}
         >
           {busy && <Loader2 size={13} className="mr-1 animate-spin" />}
-          Create
+          Create & save
         </Button>
         <Button variant="ghost" size="sm" onClick={onCancel}>Cancel</Button>
       </div>
@@ -593,4 +860,3 @@ function FieldInput({
     </div>
   );
 }
-

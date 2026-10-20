@@ -39,6 +39,7 @@ export interface UseConnectionsReturn extends UseConnectionsState {
   addCredential: (connectionId: string, input: AddCredentialInput) => Promise<boolean>;
   updateCredential: (connectionId: string, credId: string, input: UpdateCredentialInput) => Promise<boolean>;
   deleteCredential: (connectionId: string, credId: string) => Promise<boolean>;
+  replaceCredential: (connectionId: string, credId: string, secret: string) => Promise<boolean>;
   addModel: (connectionId: string, input: AddModelInput) => Promise<boolean>;
   updateModel: (connectionId: string, modelId: string, input: UpdateModelInput) => Promise<boolean>;
   deleteModel: (connectionId: string, modelId: string) => Promise<boolean>;
@@ -243,6 +244,27 @@ export function useConnections(): UseConnectionsReturn {
     [refresh],
   );
 
+  const replaceCredential = useCallback(
+    async (connectionId: string, credId: string, secret: string): Promise<boolean> => {
+      // Delete the old key, then add the new one. Done sequentially so the
+      // connection never has zero keys between operations if the add succeeds.
+      const { error: delErr } = await connApi.deleteCredential(connectionId, credId);
+      if (delErr) {
+        setState((s) => ({ ...s, error: toMessage(delErr, 'Failed to replace API key.') }));
+        return false;
+      }
+      const { error: addErr } = await connApi.addCredential(connectionId, { secret, isPrimary: true });
+      if (addErr) {
+        setState((s) => ({ ...s, error: toMessage(addErr, 'Old key was removed but the new key could not be saved. Please add it again.') }));
+        await refresh();
+        return false;
+      }
+      await refresh();
+      return true;
+    },
+    [refresh],
+  );
+
   const clearError = useCallback(() => setState((s) => ({ ...s, error: null })), []);
 
   const refreshModels = useCallback(
@@ -289,6 +311,7 @@ export function useConnections(): UseConnectionsReturn {
     addCredential,
     updateCredential,
     deleteCredential,
+    replaceCredential,
     addModel,
     updateModel,
     deleteModel,
