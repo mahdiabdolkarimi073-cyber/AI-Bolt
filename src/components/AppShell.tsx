@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { PanelRightOpen, PanelLeftOpen } from 'lucide-react';
 import { TopBar } from './TopBar';
 import { Sidebar } from './Sidebar';
@@ -11,7 +11,6 @@ import { PromptDialog } from './PromptDialog';
 import { ConfirmDialog } from './ConfirmDialog';
 import { DiagnoseDialog } from './DiagnoseDialog';
 import { ErrorBoundary } from './ErrorBoundary';
-import { useSettings } from '@/hooks/useSettings';
 import { useAgentChat } from '@/hooks/useAgentChat';
 import { useWorkspace, type OpenFileTab } from '@/hooks/useWorkspace';
 import { useTerminal } from '@/hooks/useTerminal';
@@ -19,11 +18,9 @@ import { useConnections } from '@/hooks/useConnections';
 import { config } from '@/config';
 import { getRepositories } from '@/services/index';
 import { workspaceService } from '@/services/workspace';
-import { providers as allProviders } from '@/data/mock';
+import { buildProviderOptions } from './ProviderSelector';
 import type { ProposedChange } from '@/types/execution';
-import type { AgentDefaults } from '@/types/connections';
 import type {
-  ProviderId,
   SidebarSection,
   BottomTab,
   ChatMessage,
@@ -42,10 +39,6 @@ type ConfirmState =
   | { kind: 'delete'; node: FileNode };
 
 export function AppShell() {
-  const { state: settingsState, update: updateSettings } = useSettings();
-  const persistedSettings =
-    settingsState.kind === 'success' ? settingsState.data : null;
-
   const workspace = useWorkspace();
   const connections = useConnections();
 
@@ -54,50 +47,93 @@ export function AppShell() {
   const hasProject = activeProject !== null;
   const projectId = activeProject?.id ?? null;
 
-  const [activeProvider, setActiveProvider] = useState<ProviderId>(
-    persistedSettings?.activeProvider ?? config.defaultProvider,
+  // Build the list of usable provider options from database connections.
+  // Only enabled connections with at least one enabled credential and enabled
+  // model appear. Disabled connections, disabled models, and keyless
+  // connections are filtered out.
+  const providerOptions = useMemo(
+    () => buildProviderOptions(connections.connections),
+    [connections.connections],
   );
-  const activeProviderObj = allProviders.find((p) => p.id === activeProvider)!;
+  const hasUsableConnections = providerOptions.length > 0;
 
-  // The active AI connection + model, loaded from the backend. In backend mode
-  // these drive the Agent; in fallback mode they stay null and the Agent uses
-  // the DevProvider simulation.
-  const [agentDefaults, setAgentDefaults] = useState<AgentDefaults | null>(null);
+  // The active AI connection + model, driven by the database. On startup we
+  // restore the saved agent defaults; the user can change selection from the
+  // toolbar, which persists the new selection back to the backend.
+  const [activeConnectionId, setActiveConnectionId] = useState<string | null>(null);
+  const [activeModelId, setActiveModelId] = useState<string | null>(null);
+  const [selectionInitialized, setSelectionInitialized] = useState(false);
 
+  // Initialize selection from backend agent defaults on first load.
   useEffect(() => {
-    if (persistedSettings) {
-      setActiveProvider(persistedSettings.activeProvider);
+    if (selectionInitialized || connections.loading) return;
+    const defaults = connections.defaults;
+    if (defaults?.connectionId && defaults?.model) {
+      // Validate that the saved default is still a usable option.
+      const valid = providerOptions.some(
+        (o) => o.connectionId === defaults.connectionId && o.modelId === defaults.model,
+      );
+      if (valid) {
+        setActiveConnectionId(defaults.connectionId);
+        setActiveModelId(defaults.model);
+      } else if (hasUsableConnections) {
+        // Saved default is stale — pick the first usable option.
+        setActiveConnectionId(providerOptions[0].connectionId);
+        setActiveModelId(providerOptions[0].modelId);
+      }
+    } else if (hasUsableConnections) {
+      // No saved default — pick the first usable option.
+      setActiveConnectionId(providerOptions[0].connectionId);
+      setActiveModelId(providerOptions[0].modelId);
     }
-  }, [persistedSettings]);
+    setSelectionInitialized(true);
+  }, [selectionInitialized, connections.loading, connections.defaults, providerOptions, hasUsableConnections]);
 
-  // Keep the active connection defaults in sync with the backend. This runs on
-  // mount and whenever the connections hook refreshes (e.g. after a connection
-  // is created, edited, deleted, or set as default).
+  // When connections refresh (e.g. after Settings changes), validate the
+  // current selection. If the selected connection or model was removed or
+  // disabled, fall back to the first usable option. Don't overwrite a valid
+  // user selection.
   useEffect(() => {
-    setAgentDefaults(connections.defaults);
-  }, [connections.defaults]);
+    if (!selectionInitialized) return;
+    if (!activeConnectionId || !activeModelId) {
+      if (hasUsableConnections) {
+        setActiveConnectionId(providerOptions[0].connectionId);
+        setActiveModelId(providerOptions[0].modelId);
+      }
+      return;
+    }
+    const stillValid = providerOptions.some(
+      (o) => o.connectionId === activeConnectionId && o.modelId === activeModelId,
+    );
+    if (!stillValid) {
+      if (hasUsableConnections) {
+        setActiveConnectionId(providerOptions[0].connectionId);
+        setActiveModelId(providerOptions[0].modelId);
+      } else {
+        setActiveConnectionId(null);
+        setActiveModelId(null);
+      }
+    }
+  }, [providerOptions, activeConnectionId, activeModelId, hasUsableConnections, selectionInitialized]);
 
   // On mount, load projects and optionally reopen the active one.
   useEffect(() => {
     (async () => {
       const list = await workspace.refreshProjects();
-      const activeId = persistedSettings?.activeProjectId;
-      if (activeId) {
-        const target = list.find((p) => p.id === activeId);
-        if (target && target.workspacePath) {
-          await workspace.openProject(target);
-        }
-      }
+      // Could restore last-opened project here if settings supported it.
+      void list;
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleProviderChange = useCallback(
-    (id: ProviderId) => {
-      setActiveProvider(id);
-      updateSettings({ activeProvider: id });
+    (connectionId: string, modelId: string) => {
+      setActiveConnectionId(connectionId);
+      setActiveModelId(modelId);
+      // Persist the selection to the backend so it survives restarts.
+      void connections.setDefaults(connectionId, modelId);
     },
-    [updateSettings],
+    [connections],
   );
 
   const [sidebarSection, setSidebarSection] = useState<SidebarSection>('explorer');
@@ -109,9 +145,9 @@ export function AppShell() {
 
   const agent = useAgentChat({
     conversationId,
-    providerId: activeProvider,
-    model: agentDefaults?.model ?? activeProviderObj.model,
-    connectionId: agentDefaults?.connectionId ?? null,
+    providerId: 'gemini' as const,
+    model: activeModelId ?? '',
+    connectionId: activeConnectionId,
     // allowSimulation defaults to false in backend mode (so we never silently
     // fake a Gemini response) and true in fallback mode (so the UI is usable
     // without a backend).
@@ -149,6 +185,12 @@ export function AppShell() {
   }));
   const chatBusy = agent.busy;
 
+  // Find the active connection detail for the chat header label.
+  const activeConn = connections.connections.find((c) => c.id === activeConnectionId);
+  const chatConnectionLabel = activeConn?.displayName ?? 'No connection';
+  const chatModelLabel = activeModelId ?? 'No model';
+  const chatConnected = activeConn?.status === 'connected';
+
   const [bottomOpen, setBottomOpen] = useState(true);
   const [bottomTab, setBottomTab] = useState<BottomTab>('terminal');
   const [bottomHeight, setBottomHeight] = useState(240);
@@ -182,13 +224,11 @@ export function AppShell() {
     async (project: Project) => {
       if (project.workspacePath) {
         await workspace.openProject(project);
-        updateSettings({ activeProjectId: project.id });
       } else {
-        // Project has no on-disk workspace; can't open files.
         workspace.clearError();
       }
     },
-    [workspace, updateSettings],
+    [workspace],
   );
 
   // --- File operations ---
@@ -243,7 +283,6 @@ export function AppShell() {
       const node = confirmState.node;
       try {
         await workspaceService.deletePath(workspace.activeProject.id, node.id, true);
-        // Close any open tab for this path.
         const tab = workspace.tabs.find((t) => t.path === node.id);
         if (tab) {
           workspace.closeTab(tab.id, true);
@@ -298,13 +337,16 @@ export function AppShell() {
     <div className="flex h-screen min-h-0 flex-col overflow-hidden bg-surface-950 text-gray-200">
       <TopBar
         projectName={projectName}
-        providers={allProviders}
-        activeProvider={activeProvider}
+        providerOptions={providerOptions}
+        activeConnectionId={activeConnectionId}
+        activeModelId={activeModelId}
         onProviderChange={handleProviderChange}
         onOpenProject={() => setProjectDialog({ open: true, mode: 'open' })}
         onNewProject={() => setProjectDialog({ open: true, mode: 'new' })}
         onOpenSettings={() => setSettingsOpen(true)}
-        aiConnected={agentDefaults?.connectionId != null}
+        aiConnected={activeConnectionId != null}
+        providerLoading={connections.loading}
+        hasUsableConnections={hasUsableConnections}
       />
 
       <div className="flex min-h-0 flex-1">
@@ -357,7 +399,9 @@ export function AppShell() {
                   busy={chatBusy}
                   onStop={handleStop}
                   onCollapse={() => setChatCollapsed(true)}
-                  activeProvider={activeProviderObj}
+                  connectionLabel={chatConnectionLabel}
+                  modelLabel={chatModelLabel}
+                  connected={chatConnected}
                   simulatedIds={simulatedIds}
                   error={agent.lastError}
                   onDismissError={agent.clearError}
@@ -414,13 +458,10 @@ export function AppShell() {
         open={settingsOpen}
         onClose={() => {
           setSettingsOpen(false);
-          // Refresh connection defaults so the Agent picks up any changes made
-          // in the Settings dialog (new connection, edited model, new default).
+          // Refresh connections so the toolbar picks up any changes made in
+          // Settings (new connection, edited model, new default, etc.).
           void connections.refresh();
         }}
-        providers={allProviders}
-        activeProvider={activeProvider}
-        onProviderChange={handleProviderChange}
         onSave={() => {}}
       />
       <ProjectDialog

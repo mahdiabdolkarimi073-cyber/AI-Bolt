@@ -76,6 +76,26 @@ def create_connection(body: ConnectionCreate):
         )
 
 
+# --- Static routes (must be registered BEFORE /{cid} to avoid shadowing) ---
+
+@router.get("/defaults")
+def get_defaults():
+    with connect() as conn:
+        return AgentDefaultsRepo.get(conn)
+
+
+@router.get("/adapters")
+def list_adapters():
+    return {"adapters": supported_adapters()}
+
+
+@router.get("/presets")
+def list_presets():
+    return {"presets": PROVIDER_PRESETS}
+
+
+# --- Dynamic connection routes ---
+
 @router.get("/{cid}")
 def get_connection(cid: str):
     with connect() as conn:
@@ -318,17 +338,11 @@ def _get_encrypted(conn, cred_id: str) -> str:
     return row["encrypted_secret"] if row else ""
 
 
-# --- Agent defaults ---
+# --- Agent defaults (PUT only; GET /defaults is registered above before /{cid}) ---
 
 class DefaultsBody(BaseModel):
     connectionId: Optional[str] = None
     model: Optional[str] = Field(default=None, max_length=120)
-
-
-@router.get("/defaults")
-def get_defaults():
-    with connect() as conn:
-        return AgentDefaultsRepo.get(conn)
 
 
 @router.put("/defaults")
@@ -340,12 +354,7 @@ def set_defaults(body: DefaultsBody):
         return AgentDefaultsRepo.set(conn, connection_id=body.connectionId, model=body.model)
 
 
-@router.get("/adapters")
-def list_adapters():
-    return {"adapters": supported_adapters()}
-
-
-# --- Provider presets ---
+# --- Provider presets (data only; GET /presets is registered above) ---
 
 PROVIDER_PRESETS = [
     {"id": "gemini", "label": "Google Gemini", "adapter": "gemini",
@@ -361,11 +370,6 @@ PROVIDER_PRESETS = [
      "baseUrl": "https://openrouter.ai/api/v1",
      "defaultModel": "openai/gpt-4o-mini"},
 ]
-
-
-@router.get("/presets")
-def list_presets():
-    return {"presets": PROVIDER_PRESETS}
 
 
 # --- Refresh models ---

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { PanelRightClose, Sparkles, MoreHorizontal, Trash2, AlertCircle, X } from 'lucide-react';
 import { ChatMessage } from './ChatMessage';
 import { ChatComposer } from './ChatComposer';
-import type { ChatMessage as ChatMessageType, Provider } from '@/types';
+import type { ChatMessage as ChatMessageType } from '@/types';
 
 interface Props {
   messages: ChatMessageType[];
@@ -10,7 +10,12 @@ interface Props {
   busy: boolean;
   onStop: () => void;
   onCollapse: () => void;
-  activeProvider: Provider;
+  /** Display label for the active connection, shown in the chat header. */
+  connectionLabel: string;
+  /** Active model id, shown in the chat header. */
+  modelLabel: string;
+  /** Whether the active connection has been tested successfully. */
+  connected: boolean;
   /** Map of message id -> simulated flag (assistant messages from the dev provider). */
   simulatedIds?: Set<string>;
   /** Last error message to surface, if any. */
@@ -18,7 +23,7 @@ interface Props {
   onDismissError?: () => void;
 }
 
-export function AIChatPanel({ messages, onSend, busy, onStop, onCollapse, activeProvider, simulatedIds, error, onDismissError }: Props) {
+export function AIChatPanel({ messages, onSend, busy, onStop, onCollapse, connectionLabel, modelLabel, connected, simulatedIds, error, onDismissError }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -39,8 +44,8 @@ export function AIChatPanel({ messages, onSend, busy, onStop, onCollapse, active
           <div className="leading-tight">
             <div className="text-xs font-semibold text-gray-100">AI Assistant</div>
             <div className="flex items-center gap-1 text-2xs text-surface-300">
-              <span className={`h-1.5 w-1.5 rounded-full ${activeProvider.status === 'connected' ? 'bg-success-500' : 'bg-surface-400'}`} />
-              {activeProvider.name} · {activeProvider.model}
+              <span className={`h-1.5 w-1.5 rounded-full ${connected ? 'bg-success-500' : 'bg-surface-400'}`} />
+              {connectionLabel} · {modelLabel}
             </div>
           </div>
         </div>

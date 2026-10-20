@@ -8,30 +8,35 @@ import {
   Circle,
   Zap,
 } from 'lucide-react';
-import { ProviderSelector } from './ProviderSelector';
+import { ProviderSelector, type ProviderOption } from './ProviderSelector';
 import { Button } from './ui/Button';
-import type { Provider, ProviderId } from '@/types';
 
 interface Props {
   projectName: string;
-  providers: Provider[];
-  activeProvider: ProviderId;
-  onProviderChange: (id: ProviderId) => void;
+  providerOptions: ProviderOption[];
+  activeConnectionId: string | null;
+  activeModelId: string | null;
+  onProviderChange: (connectionId: string, modelId: string) => void;
   onOpenProject: () => void;
   onNewProject: () => void;
   onOpenSettings: () => void;
   aiConnected: boolean;
+  providerLoading: boolean;
+  hasUsableConnections: boolean;
 }
 
 export function TopBar({
   projectName,
-  providers,
-  activeProvider,
+  providerOptions,
+  activeConnectionId,
+  activeModelId,
   onProviderChange,
   onOpenProject,
   onNewProject,
   onOpenSettings,
   aiConnected,
+  providerLoading,
+  hasUsableConnections,
 }: Props) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -83,7 +88,15 @@ export function TopBar({
           </span>
         </div>
 
-        <ProviderSelector providers={providers} activeId={activeProvider} onChange={onProviderChange} />
+        <ProviderSelector
+          options={providerOptions}
+          activeConnectionId={activeConnectionId}
+          activeModelId={activeModelId}
+          onChange={onProviderChange}
+          loading={providerLoading}
+          hasUsableConnections={hasUsableConnections}
+          onConfigure={onOpenSettings}
+        />
 
         <div className="hidden h-5 w-px bg-surface-700 sm:block" />
 

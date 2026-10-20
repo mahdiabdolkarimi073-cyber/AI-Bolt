@@ -31,10 +31,21 @@ class EncryptionError(Exception):
 
 
 def _get_key() -> Optional[bytes]:
-    """Load the master key from the environment. Returns None if unset/invalid."""
+    """Load the master key. Checks os.environ first, then Settings (loaded
+    from backend/.env), so a key configured in .env works even when the
+    process was not launched with PAIDE_ENC_KEY in its environment. Returns
+    None if unset/invalid.
+    """
     import os
 
     raw = os.environ.get("PAIDE_ENC_KEY")
+    if not raw:
+        try:
+            from app.config import settings
+
+            raw = settings.paide_enc_key
+        except Exception:
+            raw = None
     if not raw:
         return None
     try:

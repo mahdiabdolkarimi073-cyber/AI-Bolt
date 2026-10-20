@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db import connect, run_migrations
+from app.devkey import ensure_dev_key, EncryptionKeyError
 from app.routes import register_routes
 from app.workspace_routes import router as workspace_router
 from app.agent_routes import router as agent_router
@@ -27,6 +28,13 @@ from app.execution import mark_stale_sessions_stopped, process_manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Ensure credential encryption is available before any route can run.
+    # In production this raises if PAIDE_ENC_KEY is missing; in development it
+    # auto-provisions a stable key in backend/.env.dev on first startup.
+    try:
+        ensure_dev_key()
+    except EncryptionKeyError as exc:
+        raise RuntimeError(f"Startup blocked — encryption key not available: {exc}") from exc
     # Run migrations on startup.
     conn = connect()
     try:
