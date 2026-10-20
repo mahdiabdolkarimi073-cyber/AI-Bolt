@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { ChevronDown, Check, Cloud, CloudOff, AlertTriangle, Loader2 } from 'lucide-react';
 import type { ApiConnectionDetail } from '@/types/connections';
+import { logger } from '@/lib/logger';
 
 /** A single selectable option in the provider dropdown: one enabled model
  *  under one usable connection. Built from database connections. */
@@ -102,6 +103,10 @@ export function ProviderSelector({
               <button
                 key={`${opt.connectionId}:${opt.modelId}`}
                 onClick={() => {
+                  logger.info('MODEL', 'Model selection changed', {
+                    connectionId: opt.connectionId,
+                    selectedModel: opt.modelId,
+                  });
                   onChange(opt.connectionId, opt.modelId);
                   setOpen(false);
                 }}

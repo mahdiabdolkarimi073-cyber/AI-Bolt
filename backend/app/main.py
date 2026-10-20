@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.logging_config import configure_logging
 from app.db import connect, run_migrations
 from app.devkey import ensure_dev_key, EncryptionKeyError
 from app.routes import register_routes
@@ -28,6 +29,8 @@ from app.execution import mark_stale_sessions_stopped, process_manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Configure structured terminal logging before anything else runs.
+    configure_logging()
     # Ensure credential encryption is available before any route can run.
     # In production this raises if PAIDE_ENC_KEY is missing; in development it
     # auto-provisions a stable key in backend/.env.dev on first startup.
@@ -59,7 +62,7 @@ app.add_middleware(
     allow_origins=[settings.frontend_origin],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-Request-Id"],
 )
 
 register_routes(app)

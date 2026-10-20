@@ -20,6 +20,7 @@ from app.connection_repos import (
 )
 from app.adapters import resolve_adapter, supported_adapters, AdapterError
 from app.crypto import is_encryption_available
+from app.logging_config import log_backend, log_provider, log_error
 from app.utils import now_ms
 from app.diagnostics import DiagnosticsRepo, DiagnosticEvent
 import time as _time
@@ -292,6 +293,13 @@ def test_connection(cid: str, body: TestRequest):
         except ValueError:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown adapter for this connection.")
 
+        log_backend(
+            "Connection test started",
+            connection_id=cid,
+            adapter=item["adapter"],
+            model=body.model,
+        )
+
         # Resolve the credential to test.
         if body.credentialId:
             row = None
@@ -322,6 +330,25 @@ def test_connection(cid: str, body: TestRequest):
         # Persist the status on the connection.
         status_str = "connected" if result.category == "ok" else "error"
         ConnectionRepo.update(conn, cid, status=status_str)
+
+        if result.category == "ok":
+            log_provider(
+                "Connection test succeeded",
+                connection_id=cid,
+                adapter=item["adapter"],
+                model=body.model,
+                duration_ms=duration_ms,
+            )
+        else:
+            log_error(
+                "Connection test failed",
+                connection_id=cid,
+                adapter=item["adapter"],
+                model=body.model,
+                category=result.category,
+                http=result.status_code or "(none)",
+                duration_ms=duration_ms,
+            )
         DiagnosticsRepo.log(conn, DiagnosticEvent(
             event_type="test_success" if result.category == "ok" else "test_failure",
             connection_id=cid, provider_id=item["adapter"], model=body.model,

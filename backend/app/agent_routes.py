@@ -20,10 +20,11 @@ import time
 import uuid
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Header, status
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.logging_config import log_backend, log_provider, log_error, is_debug_enabled
 from app.db import connect
 from app.repositories import ConversationRepo, MessageRepo
 from app.connection_repos import ConnectionRepo, CredentialRepo, AgentDefaultsRepo
@@ -163,11 +164,15 @@ def _safe_usage(usage: Optional[dict]) -> Optional[dict]:
 def _log_request_start(request_id: str, *, selected_connection_id: Optional[str],
                         selected_model: str, resolved_connection_id: Optional[str],
                         adapter_id: str, resolved_model: str, cred_id: Optional[str]):
-    logger.info(
-        "[agent] request_id=%s selected_conn=%s selected_model=%s "
-        "resolved_conn=%s adapter=%s resolved_model=%s cred_id=%s",
-        request_id, selected_connection_id or "(default)", selected_model or "(empty)",
-        resolved_connection_id, adapter_id, resolved_model, cred_id or "(none)",
+    log_backend(
+        "AI request started",
+        request_id=request_id,
+        selected_conn=selected_connection_id or "(default)",
+        selected_model=selected_model or "(empty)",
+        resolved_conn=resolved_connection_id or "(none)",
+        adapter=adapter_id,
+        resolved_model=resolved_model,
+        cred_id=cred_id or "(none)",
     )
 
 
@@ -175,23 +180,30 @@ def _log_request_success(request_id: str, *, resolved_model: str,
                           provider_model: Optional[str], response_id: Optional[str],
                           status_code: int, duration_ms: int, usage: Optional[dict],
                           fallback: bool):
-    logger.info(
-        "[agent] request_id=%s model_sent=%s provider_model=%s response_id=%s "
-        "http=%d duration=%dms usage=%s fallback=%s",
-        request_id, resolved_model, provider_model or "(unreported)",
-        response_id or "(none)", status_code, duration_ms,
-        usage or "(none)", str(fallback).lower(),
+    log_provider(
+        "Provider response received",
+        request_id=request_id,
+        model_sent=resolved_model,
+        provider_model=provider_model or "(unreported)",
+        response_id=response_id or "(none)",
+        http=status_code,
+        duration_ms=duration_ms,
+        usage=usage or "(none)",
+        fallback=str(fallback).lower(),
     )
 
 
 def _log_request_failure(request_id: str, *, resolved_model: str,
                           error_code: str, error_msg: str, status_code: Optional[int],
                           duration_ms: int):
-    logger.warning(
-        "[agent] request_id=%s model_sent=%s error_code=%s http=%s duration=%dms msg=%s",
-        request_id, resolved_model, error_code,
-        status_code if status_code is not None else "(none)",
-        duration_ms, error_msg[:200],
+    log_error(
+        "AI request failed",
+        request_id=request_id,
+        model_sent=resolved_model or "(none)",
+        error_code=error_code,
+        http=status_code if status_code is not None else "(none)",
+        duration_ms=duration_ms,
+        msg=error_msg[:200],
     )
 
 
@@ -210,25 +222,38 @@ def _chat_with_retry(adapter, base_url: str, secret: str, model: str,
             if exc.category in _NON_RETRYABLE or attempt >= _MAX_RETRIES:
                 raise
             last_exc = exc
-            logger.info(
-                "[agent] retryable adapter error (attempt %d): category=%s, retrying",
-                attempt + 1, exc.category,
+            log_provider(
+                "Retryable adapter error, retrying",
+                attempt=attempt + 1,
+                category=exc.category,
             )
         except Exception as exc:
             if attempt >= _MAX_RETRIES:
                 raise
             last_exc = exc
-            logger.info(
-                "[agent] retryable error (attempt %d): %s, retrying",
-                attempt + 1, str(exc)[:200],
+            log_provider(
+                "Retryable error, retrying",
+                attempt=attempt + 1,
+                msg=str(exc)[:200],
             )
     raise last_exc  # type: ignore[misc]
 
 
 @router.post("/run", response_model=AgentRunResponse)
-def run_agent(body: AgentRunRequest):
+def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id")):
     started = int(time.time() * 1000)
-    request_id = str(uuid.uuid4())
+    # Prefer the frontend-supplied request id for log correlation. Fall back to
+    # a server-generated uuid when the header is missing (e.g. direct API calls).
+    request_id = (x_request_id or "").strip() or str(uuid.uuid4())
+    log_backend(
+        "Backend received AI request",
+        request_id=request_id,
+        endpoint="/agent/run",
+        conversation_id=body.conversationId,
+        selected_model=body.model or "(empty)",
+        provider_id=body.providerId or "(none)",
+        message_len=len(body.message),
+    )
 
     with connect() as conn:
         conv = ConversationRepo.get(conn, body.conversationId)
@@ -535,6 +560,7 @@ def run_agent(body: AgentRunRequest):
                 error_msg=exc_msg,
                 status_code=None, duration_ms=req_dur,
             )
+            log_error("Unexpected provider exception", exc=exc, request_id=request_id, model=model)
             DiagnosticsRepo.log(conn, DiagnosticEvent(
                 event_type="ai_request_failure", connection_id=connection["id"],
                 provider_id=connection["adapter"], model=model,

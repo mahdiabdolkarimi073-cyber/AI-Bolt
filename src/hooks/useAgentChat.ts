@@ -7,6 +7,7 @@ import { getRepositories } from '@/services/index';
 import { runAgentViaBackend } from '@/services/agentBackend';
 import { apiErrorToAgentError } from '@/types/agent';
 import type { ProviderExecutionMeta } from '@/types/agent';
+import { logger } from '@/lib/logger';
 
 /**
  * React hook that bridges the Agent runtime to the chat UI.
@@ -105,24 +106,36 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
       controllerRef.current = controller;
       reqCounter.current += 1;
       const requestId = `req-${Date.now().toString(36)}-${reqCounter.current}`;
+      const startTime = performance.now();
+
+      logger.info('CHAT', 'User message submitted', {
+        requestId,
+        conversationId: cid,
+        provider: providerId,
+        selectedModel: model || '(empty)',
+        connectionId: connectionId ?? '(default)',
+        messageLen: trimmed.length,
+      });
 
       setState((s) => ({ ...s, busy: true, lastError: null }));
 
       try {
         let result: AgentResult;
         if (config.backendEnabled) {
-          // Log a frontend diagnostic entry so requests can be correlated with
-          // backend logs using the same requestId.
-          console.info(
-            `[agent] requestId=${requestId} conn=${connectionId ?? '(default)'} ` +
-            `model=${model || '(empty)'} provider=${providerId}`,
-          );
+          logger.debug('CHAT', 'Sending request to backend', {
+            requestId,
+            endpoint: '/agent/run',
+            provider: providerId,
+            selectedModel: model || '(empty)',
+          });
           const { data, error } = await runAgentViaBackend({
             conversationId: cid,
             message: trimmed,
             config: { providerId, model, connectionId: connectionId ?? undefined, allowSimulation: simulationAllowed, projectId },
             signal: controller.signal,
+            requestId,
           });
+          const durationMs = Math.round(performance.now() - startTime);
           if (error || !data) {
             result = {
               requestId,
@@ -134,8 +147,22 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
               startedAt: Date.now(),
               finishedAt: Date.now(),
             };
+            logger.error('ERROR', 'Backend agent run failed', {
+              requestId,
+              error_code: result.error?.code ?? 'unknown',
+              durationMs,
+            });
           } else {
             result = data;
+            logger.info('CHAT', 'Backend response received', {
+              requestId,
+              status: result.status,
+              durationMs,
+              resolvedModel: result.meta?.model ?? '(none)',
+              providerReportedModel: result.meta?.providerReportedModel ?? '(unreported)',
+              modelSubstituted: result.meta?.modelSubstituted ?? false,
+              simulated: result.meta?.simulated ?? false,
+            });
           }
         } else {
           const runtime = getAgentRuntime();
@@ -146,6 +173,22 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
             config: { providerId, model, connectionId: connectionId ?? undefined, allowSimulation: simulationAllowed, projectId },
             signal: controller.signal,
           });
+          const durationMs = Math.round(performance.now() - startTime);
+          if (result.status === 'completed') {
+            logger.info('CHAT', 'Local runtime completed', {
+              requestId,
+              status: result.status,
+              durationMs,
+              resolvedModel: result.meta?.model ?? '(none)',
+              simulated: result.meta?.simulated ?? false,
+            });
+          } else if (result.status === 'failed') {
+            logger.error('ERROR', 'Local runtime failed', {
+              requestId,
+              error_code: result.error?.code ?? 'unknown',
+              durationMs,
+            });
+          }
         }
 
         // Refresh persisted messages from the authoritative store.
@@ -162,7 +205,13 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
         }));
         return result;
       } catch (err) {
+        const durationMs = Math.round(performance.now() - startTime);
         const msg = err instanceof Error ? err.message : 'Unexpected error.';
+        logger.error('ERROR', 'Unexpected exception during chat', {
+          requestId,
+          durationMs,
+          msg: msg.slice(0, 200),
+        });
         setState((s) => ({ ...s, busy: false, lastError: msg }));
         return null;
       } finally {
@@ -175,6 +224,7 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
   const stop = useCallback(() => {
     if (controllerRef.current) {
       controllerRef.current.abort();
+      logger.warn('CHAT', 'Request cancelled by user', {});
     }
     if (!config.backendEnabled && conversationId) {
       getAgentRuntime().cancel(conversationId);

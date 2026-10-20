@@ -1,4 +1,5 @@
 import { request } from '@/lib/http';
+import { logger } from '@/lib/logger';
 import type { ApiResult } from '@/types/domain';
 import type { ProviderId } from '@/types';
 import type { AgentResult, AgentConfig } from '@/types/agent';
@@ -18,6 +19,8 @@ export interface BackendAgentRunInput {
   message: string;
   config: AgentConfig;
   signal?: AbortSignal;
+  /** Frontend-generated request id for log correlation. */
+  requestId?: string;
 }
 
 /** Shape returned by POST /agent/run. */
@@ -64,8 +67,16 @@ export async function runAgentViaBackend(input: BackendAgentRunInput): Promise<A
       maxRetrievalChars: input.config.maxRetrievalChars ?? 3500,
     },
     signal: input.signal,
+    requestId: input.requestId,
+    logPrefix: 'CHAT',
   });
-  if (error) return { data: null, error };
+  if (error) {
+    logger.error('CHAT', 'Backend agent run returned error', {
+      requestId: input.requestId ?? '(none)',
+      error_code: error.code,
+    });
+    return { data: null, error };
+  }
   if (!data) return { data: null, error: { code: 'server', message: 'Empty response from backend.' } };
   return { data: toAgentResult(data), error: null };
 }

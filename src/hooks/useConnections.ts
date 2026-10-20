@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { config } from '@/config';
+import { logger } from '@/lib/logger';
 import type { ApiError } from '@/types/domain';
 import type {
   ApiConnectionDetail,
@@ -220,10 +221,41 @@ export function useConnections(): UseConnectionsReturn {
 
   const testConnection = useCallback(
     async (connectionId: string, model: string, credentialId?: string): Promise<ConnectionTestResult | null> => {
+      logger.info('CONNECTION', 'Connection test initiated', {
+        connectionId,
+        model,
+        credentialId: credentialId ?? '(default)',
+      });
+      const startTime = performance.now();
       const { data, error } = await connApi.testConnection(connectionId, model, credentialId);
+      const durationMs = Math.round(performance.now() - startTime);
       if (error) {
+        logger.error('ERROR', 'Connection test failed', {
+          connectionId,
+          model,
+          error_code: error.code,
+          durationMs,
+        });
         setState((s) => ({ ...s, error: toMessage(error, 'Failed to test connection.') }));
         return null;
+      }
+      if (data) {
+        if (data.category === 'ok') {
+          logger.info('CONNECTION', 'Connection test succeeded', {
+            connectionId,
+            model,
+            category: data.category,
+            durationMs,
+          });
+        } else {
+          logger.warn('CONNECTION', 'Connection test returned error category', {
+            connectionId,
+            model,
+            category: data.category,
+            http: data.statusCode ?? '(none)',
+            durationMs,
+          });
+        }
       }
       await refresh();
       return data;
@@ -233,6 +265,10 @@ export function useConnections(): UseConnectionsReturn {
 
   const setDefaults = useCallback(
     async (connectionId: string | null, model: string | null): Promise<boolean> => {
+      logger.info('MODEL', 'Agent defaults changed', {
+        connectionId: connectionId ?? '(none)',
+        model: model ?? '(none)',
+      });
       const { error } = await connApi.setAgentDefaults(connectionId, model);
       if (error) {
         setState((s) => ({ ...s, error: toMessage(error, 'Failed to set defaults.') }));
@@ -274,6 +310,10 @@ export function useConnections(): UseConnectionsReturn {
         setState((s) => ({ ...s, error: toMessage(error, 'Failed to refresh models.') }));
         return null;
       }
+      logger.info('MODEL', 'Model list refreshed', {
+        connectionId,
+        count: data?.length ?? 0,
+      });
       return data;
     },
     [],

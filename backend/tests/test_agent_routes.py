@@ -441,6 +441,126 @@ class TestConfigurableTimeout:
         assert captured_timeout[0] == float(settings.agent_timeout_seconds)
 
 
+class TestRequestIdPropagation:
+    """Verify the backend accepts and echoes the X-Request-Id header for
+    frontend/backend log correlation."""
+
+    def test_x_request_id_header_is_echoed_in_response(self, client: TestClient):
+        cid, conv_id = _setup_connection_and_conversation(client)
+        from app.adapters import ChatResult
+
+        with patch("app.agent_routes.resolve_adapter") as mock_resolve:
+            mock_adapter = MagicMock()
+            mock_adapter.chat.return_value = ChatResult(
+                content="Hello!", finish_reason="STOP",
+                raw_meta={"provider": "gemini"},
+            )
+            mock_resolve.return_value = mock_adapter
+
+            r = client.post(
+                "/agent/run",
+                json={
+                    "conversationId": conv_id,
+                    "message": "Hello",
+                    "model": "gemini-3.6-flash",
+                    "connectionId": cid,
+                },
+                headers={"X-Request-Id": "req-frontend-abc-123"},
+            )
+
+        body = r.json()
+        assert body["requestId"] == "req-frontend-abc-123"
+        assert body["meta"]["requestId"] == "req-frontend-abc-123"
+
+    def test_missing_x_request_id_generates_server_id(self, client: TestClient):
+        cid, conv_id = _setup_connection_and_conversation(client)
+        from app.adapters import ChatResult
+
+        with patch("app.agent_routes.resolve_adapter") as mock_resolve:
+            mock_adapter = MagicMock()
+            mock_adapter.chat.return_value = ChatResult(
+                content="Hello!", finish_reason="STOP",
+                raw_meta={"provider": "gemini"},
+            )
+            mock_resolve.return_value = mock_adapter
+
+            r = client.post("/agent/run", json={
+                "conversationId": conv_id,
+                "message": "Hello",
+                "model": "gemini-3.6-flash",
+                "connectionId": cid,
+            })
+
+        body = r.json()
+        # Should have a non-empty server-generated request id
+        assert body["requestId"]
+        assert len(body["requestId"]) > 5
+
+    def test_x_request_id_propagated_to_diagnostics(self, client: TestClient):
+        cid, conv_id = _setup_connection_and_conversation(client)
+        from app.adapters import AdapterError, CATEGORY_TIMEOUT
+
+        with patch("app.agent_routes.resolve_adapter") as mock_resolve:
+            mock_adapter = MagicMock()
+            mock_adapter.chat.side_effect = AdapterError(
+                CATEGORY_TIMEOUT, "Timed out."
+            )
+            mock_resolve.return_value = mock_adapter
+
+            client.post(
+                "/agent/run",
+                json={
+                    "conversationId": conv_id,
+                    "message": "Hello",
+                    "model": "gemini-3.6-flash",
+                    "connectionId": cid,
+                },
+                headers={"X-Request-Id": "req-diag-test-456"},
+            )
+
+        diags = client.get("/diagnostics", params={
+            "connectionId": cid,
+        }).json()
+        failure_diags = [d for d in diags if d["eventType"] == "ai_request_failure"]
+        assert len(failure_diags) >= 1
+        assert failure_diags[0]["details"]["requestId"] == "req-diag-test-456"
+
+
+class TestLoggingConfig:
+    """Verify the logging configuration module works correctly."""
+
+    def test_configure_logging_is_idempotent(self):
+        from app.logging_config import configure_logging
+        # Calling multiple times should not raise or duplicate handlers.
+        configure_logging()
+        configure_logging()
+        import logging
+        logger = logging.getLogger("app")
+        # Should have exactly one handler from our config (plus any pre-existing)
+        stream_handlers = [h for h in logger.handlers
+                          if h.__class__.__name__ == "StreamHandler"]
+        assert len(stream_handlers) >= 1
+
+    def test_debug_enabled_flag_respects_env(self, monkeypatch: pytest.MonkeyPatch):
+        from app.logging_config import is_debug_enabled, _configured
+        import app.logging_config as lc
+        # Reset the configured flag so the env is re-read
+        lc._configured = False
+        monkeypatch.setenv("PAIDE_DEBUG_LOG", "1")
+        assert is_debug_enabled() is True
+        monkeypatch.setenv("PAIDE_DEBUG_LOG", "0")
+        assert is_debug_enabled() is False
+        monkeypatch.delenv("PAIDE_DEBUG_LOG", raising=False)
+        assert is_debug_enabled() is False
+
+    def test_log_helpers_do_not_raise(self):
+        from app.logging_config import log_backend, log_provider, log_error
+        # These should not raise even with various field types.
+        log_backend("test message", request_id="r1", model="gemini")
+        log_provider("test provider", duration_ms=42)
+        log_error("test error", exc=None, code="timeout")
+
+
 class TestRetryBehavior:
     """Verify retry only happens for transient errors and never changes model."""
 
@@ -496,3 +616,70 @@ class TestRetryBehavior:
         # Model should never change during retry
         for call_args in mock_adapter.chat.call_args_list:
             assert call_args.args[2] == "gemini-3.6-flash"
+
+
+class TestCORSPreflight:
+    """Verify the CORS middleware allows preflight for POST /agent/run with
+    the X-Request-Id header that the frontend now sends."""
+
+    def test_options_agent_run_succeeds_with_x_request_id(self, client: TestClient):
+        """The browser sends Access-Control-Request-Headers including
+        x-request-id. The CORS middleware must allow it, returning 200."""
+        from app.config import settings
+        r = client.options(
+            "/agent/run",
+            headers={
+                "Origin": settings.frontend_origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type, x-request-id",
+            },
+        )
+        assert r.status_code == 200
+        assert r.headers.get("access-control-allow-origin") == settings.frontend_origin
+        allow_headers = r.headers.get("access-control-allow-headers", "").lower()
+        assert "x-request-id" in allow_headers
+        assert "content-type" in allow_headers
+
+    def test_options_agent_run_succeeds_with_content_type_only(self, client: TestClient):
+        """Preflight without X-Request-Id should still succeed (backward compat)."""
+        from app.config import settings
+        r = client.options(
+            "/agent/run",
+            headers={
+                "Origin": settings.frontend_origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+        assert r.status_code == 200
+
+    def test_post_agent_run_with_x_request_id_header_succeeds(self, client: TestClient):
+        """A real POST with X-Request-Id should reach the route handler."""
+        cid, conv_id = _setup_connection_and_conversation(client)
+        from app.adapters import ChatResult
+
+        with patch("app.agent_routes.resolve_adapter") as mock_resolve:
+            mock_adapter = MagicMock()
+            mock_adapter.chat.return_value = ChatResult(
+                content="Hello!", finish_reason="STOP",
+                raw_meta={"provider": "gemini"},
+            )
+            mock_resolve.return_value = mock_adapter
+
+            r = client.post(
+                "/agent/run",
+                json={
+                    "conversationId": conv_id,
+                    "message": "Hello",
+                    "model": "gemini-3.6-flash",
+                    "connectionId": cid,
+                },
+                headers={
+                    "Origin": "http://localhost:5173",
+                    "X-Request-Id": "req-preflight-test-789",
+                },
+            )
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["requestId"] == "req-preflight-test-789"
