@@ -88,4 +88,41 @@ describe('agentBackend connection routing', () => {
     // error envelope is null because the HTTP call succeeded; the failure is in the body.
     expect(error).toBeNull();
   });
+
+  it('defaults allowSimulation to false and connectionId to null in the request body', async () => {
+    const fetchMock = mockFetch({
+      requestId: 'r4',
+      conversationId: 'c4',
+      status: 'completed',
+      userMessage: { id: 'm1', conversationId: 'c4', role: 'user', content: 'hi', createdAt: 1 },
+      assistantMessage: { id: 'm2', conversationId: 'c4', role: 'assistant', content: 'hello', createdAt: 2 },
+      meta: { providerId: 'gemini', connectionId: 'conn-1', model: 'gemini-2.0-flash', simulated: false },
+      startedAt: 1,
+      finishedAt: 2,
+    });
+    // No connectionId, no allowSimulation — both should default safely.
+    const config: AgentConfig = { providerId: 'gemini', model: 'gemini-2.0-flash' };
+    const { data } = await runAgentViaBackend({ conversationId: 'c4', message: 'hi', config });
+    expect(data?.status).toBe('completed');
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.allowSimulation).toBe(false);
+    expect(body.connectionId).toBeUndefined();
+  });
+
+  it('forwards allowSimulation: true when explicitly set', async () => {
+    const fetchMock = mockFetch({
+      requestId: 'r5',
+      conversationId: 'c5',
+      status: 'completed',
+      userMessage: { id: 'm1', conversationId: 'c5', role: 'user', content: 'hi', createdAt: 1 },
+      assistantMessage: { id: 'm2', conversationId: 'c5', role: 'assistant', content: 'sim', createdAt: 2 },
+      meta: { providerId: 'dev', model: 'dev-simulated', simulated: true },
+      startedAt: 1,
+      finishedAt: 2,
+    });
+    const config: AgentConfig = { providerId: 'gemini', model: 'dev-simulated', allowSimulation: true };
+    await runAgentViaBackend({ conversationId: 'c5', message: 'hi', config });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.allowSimulation).toBe(true);
+  });
 });

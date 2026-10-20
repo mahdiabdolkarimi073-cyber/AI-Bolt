@@ -15,11 +15,13 @@ import { useSettings } from '@/hooks/useSettings';
 import { useAgentChat } from '@/hooks/useAgentChat';
 import { useWorkspace, type OpenFileTab } from '@/hooks/useWorkspace';
 import { useTerminal } from '@/hooks/useTerminal';
+import { useConnections } from '@/hooks/useConnections';
 import { config } from '@/config';
 import { getRepositories } from '@/services/index';
 import { workspaceService } from '@/services/workspace';
 import { providers as allProviders } from '@/data/mock';
 import type { ProposedChange } from '@/types/execution';
+import type { AgentDefaults } from '@/types/connections';
 import type {
   ProviderId,
   SidebarSection,
@@ -45,6 +47,7 @@ export function AppShell() {
     settingsState.kind === 'success' ? settingsState.data : null;
 
   const workspace = useWorkspace();
+  const connections = useConnections();
 
   const activeProject = workspace.activeProject;
   const projectName = activeProject?.name ?? 'No project open';
@@ -56,11 +59,23 @@ export function AppShell() {
   );
   const activeProviderObj = allProviders.find((p) => p.id === activeProvider)!;
 
+  // The active AI connection + model, loaded from the backend. In backend mode
+  // these drive the Agent; in fallback mode they stay null and the Agent uses
+  // the DevProvider simulation.
+  const [agentDefaults, setAgentDefaults] = useState<AgentDefaults | null>(null);
+
   useEffect(() => {
     if (persistedSettings) {
       setActiveProvider(persistedSettings.activeProvider);
     }
   }, [persistedSettings]);
+
+  // Keep the active connection defaults in sync with the backend. This runs on
+  // mount and whenever the connections hook refreshes (e.g. after a connection
+  // is created, edited, deleted, or set as default).
+  useEffect(() => {
+    setAgentDefaults(connections.defaults);
+  }, [connections.defaults]);
 
   // On mount, load projects and optionally reopen the active one.
   useEffect(() => {
@@ -95,8 +110,11 @@ export function AppShell() {
   const agent = useAgentChat({
     conversationId,
     providerId: activeProvider,
-    model: activeProviderObj.model,
-    allowSimulation: true,
+    model: agentDefaults?.model ?? activeProviderObj.model,
+    connectionId: agentDefaults?.connectionId ?? null,
+    // allowSimulation defaults to false in backend mode (so we never silently
+    // fake a Gemini response) and true in fallback mode (so the UI is usable
+    // without a backend).
     projectId,
   });
 
@@ -286,7 +304,7 @@ export function AppShell() {
         onOpenProject={() => setProjectDialog({ open: true, mode: 'open' })}
         onNewProject={() => setProjectDialog({ open: true, mode: 'new' })}
         onOpenSettings={() => setSettingsOpen(true)}
-        aiConnected={activeProviderObj.status === 'connected'}
+        aiConnected={agentDefaults?.connectionId != null}
       />
 
       <div className="flex min-h-0 flex-1">
@@ -394,7 +412,12 @@ export function AppShell() {
 
       <SettingsDialog
         open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
+        onClose={() => {
+          setSettingsOpen(false);
+          // Refresh connection defaults so the Agent picks up any changes made
+          // in the Settings dialog (new connection, edited model, new default).
+          void connections.refresh();
+        }}
         providers={allProviders}
         activeProvider={activeProvider}
         onProviderChange={handleProviderChange}

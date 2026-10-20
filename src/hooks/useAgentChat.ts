@@ -23,7 +23,13 @@ export interface UseAgentChatOptions {
   conversationId: string | null;
   providerId: ProviderId;
   model: string;
-  /** Allow the deterministic dev provider to answer when no real provider is ready. */
+  /** Phase 6: configured connection id. When set, the backend routes through
+   *  that connection's adapter + credentials. When null in backend mode, the
+   *  backend uses its configured agent default. */
+  connectionId?: string | null;
+  /** Allow the deterministic dev provider to answer when no real provider is ready.
+   *  Defaults to false in backend mode (never silently simulate) and true in
+   *  browser fallback mode (so the UI is still exercisable without a backend). */
   allowSimulation?: boolean;
   /** Phase 7: active project id for memory/knowledge retrieval scoping. */
   projectId?: string | null;
@@ -46,7 +52,11 @@ export interface UseAgentChatReturn extends AgentChatState {
 }
 
 export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
-  const { conversationId, providerId, model, allowSimulation = true, projectId = null } = opts;
+  const { conversationId, providerId, model, connectionId = null, allowSimulation, projectId = null } = opts;
+  // In backend mode, default simulation OFF — never silently return a simulated
+  // response when a real connection is expected. In fallback mode, allow it so
+  // the UI remains demonstrable without a backend.
+  const simulationAllowed = allowSimulation ?? !config.backendEnabled;
   const [state, setState] = useState<AgentChatState>({
     messages: [],
     busy: false,
@@ -100,7 +110,7 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
           const { data, error } = await runAgentViaBackend({
             conversationId: cid,
             message: trimmed,
-            config: { providerId, model, allowSimulation, projectId },
+            config: { providerId, model, connectionId: connectionId ?? undefined, allowSimulation: simulationAllowed, projectId },
             signal: controller.signal,
           });
           if (error || !data) {
@@ -123,7 +133,7 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
             conversationId: cid,
             message: trimmed,
             requestId,
-            config: { providerId, model, allowSimulation, projectId },
+            config: { providerId, model, connectionId: connectionId ?? undefined, allowSimulation: simulationAllowed, projectId },
             signal: controller.signal,
           });
         }
@@ -148,7 +158,7 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
         controllerRef.current = null;
       }
     },
-    [conversationId, providerId, model, allowSimulation, projectId, refresh],
+    [conversationId, providerId, model, connectionId, simulationAllowed, projectId, refresh],
   );
 
   const stop = useCallback(() => {
