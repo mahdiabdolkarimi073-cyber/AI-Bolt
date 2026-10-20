@@ -45,7 +45,7 @@ export type SidebarSection =
   | 'knowledge'
   | 'settings';
 
-export type BottomTab = 'terminal' | 'problems' | 'output' | 'tests';
+export type BottomTab = 'terminal' | 'problems' | 'output' | 'tests' | 'preview';
 
 export interface Toast {
   id: string;
