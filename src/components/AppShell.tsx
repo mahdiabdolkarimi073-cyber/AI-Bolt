@@ -10,6 +10,7 @@ import { ProjectDialog } from './ProjectDialog';
 import { PromptDialog } from './PromptDialog';
 import { ConfirmDialog } from './ConfirmDialog';
 import { DiagnoseDialog } from './DiagnoseDialog';
+import { ErrorBoundary } from './ErrorBoundary';
 import { useSettings } from '@/hooks/useSettings';
 import { useAgentChat } from '@/hooks/useAgentChat';
 import { useWorkspace, type OpenFileTab } from '@/hooks/useWorkspace';
@@ -289,6 +290,7 @@ export function AppShell() {
       />
 
       <div className="flex min-h-0 flex-1">
+        <ErrorBoundary label="Sidebar">
         <Sidebar
           active={sidebarSection}
           onChange={setSidebarSection}
@@ -310,7 +312,9 @@ export function AppShell() {
           onCreateDir={handleCreateDir}
           onRenameNode={handleRenameNode}
           onDeleteNode={handleDeleteNode}
+          onExpandFolder={workspace.loadFolderChildren}
         />
+        </ErrorBoundary>
 
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="relative flex min-h-0 flex-1">

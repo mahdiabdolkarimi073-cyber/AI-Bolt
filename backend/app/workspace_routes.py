@@ -48,6 +48,10 @@ from app.filesystem import (
 )
 from app.repositories import ProjectRepo, RecentProjectsRepo
 
+import logging
+
+logger = logging.getLogger("workspace_routes")
+
 router = APIRouter(prefix="/workspace", tags=["workspace"])
 
 LANG_MAP = {
@@ -95,13 +99,18 @@ def list_tree(project_id: str, subpath: str = "", depth: int = 1):
     (children have children=null). depth>1 recursively expands folders up to
     `depth` levels. Excluded directories are included in the listing but their
     children are not auto-expanded."""
+    logger.info("[WORKSPACE-DEBUG] backend_list_tree START project_id=%s subpath=%r depth=%s", project_id, subpath, depth)
     try:
         _safe_sub = validate_relative_path(subpath) if subpath else "."
     except FilesystemError as e:
+        logger.warning("[WORKSPACE-DEBUG] backend_list_tree REJECT subpath=%r reason=%s", subpath, e.detail if hasattr(e, 'detail') else str(e))
         raise e
     _, root = _resolve_project(project_id)
     target = root if _safe_sub == "." else safe_resolve_in_project(root, _safe_sub)
+    logger.info("[WORKSPACE-DEBUG] backend_list_tree RESOLVED project_id=%s root=%s target=%s exists=%s is_dir=%s",
+                project_id, root, target, target.exists(), target.is_dir() if target.exists() else 'N/A')
     if not target.exists() or not target.is_dir():
+        logger.warning("[WORKSPACE-DEBUG] backend_list_tree NOT_FOUND project_id=%s target=%s", project_id, target)
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail={"code": "not_found", "message": "Directory not found."})
 
     def build(dir_path: Path, current_depth: int) -> list[dict]:
@@ -125,7 +134,9 @@ def list_tree(project_id: str, subpath: str = "", depth: int = 1):
             count += 1
         return nodes
 
-    return build(target, max(1, min(depth, 4)))
+    result = build(target, max(1, min(depth, 4)))
+    logger.info("[WORKSPACE-DEBUG] backend_list_tree OK project_id=%s subpath=%r child_count=%d", project_id, subpath, len(result))
+    return result
 
 
 # --- File read / write / delete ---
@@ -428,13 +439,29 @@ async def import_zip(name: str = "", file: UploadFile = File(...)):
             detail={"code": "too_many_files", "message": f"Archive has more than {MAX_EXTRACTED_FILES} entries."},
         )
 
-    names = [e.filename for e in entries]
-    top_dirs = {n.split("/")[0] for n in names if n and not n.startswith("/")}
-    single_root = len(top_dirs) == 1 and "/" in names[0]
+    names = [e.filename.replace("\\", "/") for e in entries]
+    # Determine whether all entries share a single top-level directory.
+    # A "top-level part" is the first segment of each non-empty path. We must
+    # include directory entries that lack a trailing slash (e.g. "myproj" as
+    # well as "myproj/") and file entries at the root ("README.md"). If every
+    # entry's first segment is the same AND at least one entry has a deeper
+    # path (second segment exists), then there is a single shared root folder.
+    top_segments: set[str] = set()
+    has_deeper = False
+    for n in names:
+        if not n:
+            continue
+        parts = [p for p in n.split("/") if p != ""]
+        if not parts:
+            continue
+        top_segments.add(parts[0])
+        if len(parts) > 1:
+            has_deeper = True
+    single_root = len(top_segments) == 1 and has_deeper
 
     base = workspace_root_path()
     if single_root:
-        root_name = next(iter(top_dirs))
+        root_name = next(iter(top_segments))
     else:
         root_name = re.sub(r"[^A-Za-z0-9._-]+", "-", desired_name).strip("-._").lower() or "imported"
 
@@ -521,10 +548,13 @@ def _zip_target(member_name: str, extract_root: Path, single_root: bool, root_na
     """Compute the on-disk target for a zip entry, stripping a common top-level
     dir if present."""
     norm = member_name.replace("\\", "/")
-    if single_root and norm.startswith(root_name + "/"):
-        rel = norm[len(root_name) + 1:]
-    elif single_root and norm == root_name:
-        rel = "."
+    if single_root:
+        parts = [p for p in norm.split("/") if p != ""]
+        if parts and parts[0] == root_name:
+            rel_parts = parts[1:]
+        else:
+            rel_parts = parts
+        rel = "/".join(rel_parts)
     else:
         rel = norm
     target = extract_root

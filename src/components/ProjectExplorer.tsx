@@ -27,6 +27,7 @@ interface Props {
   onRename: (node: FileNode) => void;
   onDelete: (node: FileNode) => void;
   onRefresh: () => void;
+  onExpandFolder: (folderPath: string) => void;
 }
 
 function fileIcon(name: string) {
@@ -52,6 +53,7 @@ function TreeItem({
   onRename,
   onDelete,
   onContextMenu,
+  onExpandFolder,
 }: {
   node: FileNode;
   depth: number;
@@ -62,15 +64,36 @@ function TreeItem({
   onRename: (n: FileNode) => void;
   onDelete: (n: FileNode) => void;
   onContextMenu: (m: MenuState) => void;
+  onExpandFolder: (folderPath: string) => void;
 }) {
   const [open, setOpen] = useState(depth < 1);
   const isFolder = node.type === 'folder';
   const isActive = activePath === node.id;
+  const needsLazyLoad = isFolder && open && node.children == null;
+
+  useEffect(() => {
+    if (needsLazyLoad) {
+      console.log('[WORKSPACE-DEBUG] folder_expand', {
+        folderPath: node.id,
+        childrenState: node.children,
+        depth,
+      });
+      onExpandFolder(node.id);
+    }
+  }, [needsLazyLoad, node.id, node.children, onExpandFolder, depth]);
 
   const handleClick = useCallback(() => {
-    if (isFolder) setOpen((o) => !o);
-    else onOpenFile(node);
-  }, [isFolder, node, onOpenFile]);
+    if (isFolder) {
+      console.log('[WORKSPACE-DEBUG] folder_click', {
+        folderPath: node.id,
+        childrenState: node.children,
+        currentlyOpen: open,
+      });
+      setOpen((o) => !o);
+    } else {
+      onOpenFile(node);
+    }
+  }, [isFolder, node, onOpenFile, open]);
 
   const handleContextMenu = useCallback(
     (e: React.MouseEvent) => {
@@ -109,22 +132,34 @@ function TreeItem({
           {node.name}
         </span>
       </div>
-      {isFolder && open && node.children && (
+      {isFolder && open && (
         <div>
-          {node.children.map((child) => (
-            <TreeItem
-              key={child.id}
-              node={child}
-              depth={depth + 1}
-              activePath={activePath}
-              onOpenFile={onOpenFile}
-              onCreateFile={onCreateFile}
-              onCreateDir={onCreateDir}
-              onRename={onRename}
-              onDelete={onDelete}
-              onContextMenu={onContextMenu}
-            />
-          ))}
+          {node.children == null ? (
+            <div className="flex items-center gap-1 px-1.5 py-[3px] text-2xs text-surface-400" style={{ paddingLeft: (depth + 1) * 12 + 6 }}>
+              <RefreshCw size={10} className="animate-spin" />
+              Loading…
+            </div>
+          ) : node.children.length === 0 ? (
+            <div className="px-1.5 py-[3px] text-2xs text-surface-400" style={{ paddingLeft: (depth + 1) * 12 + 6 }}>
+              Empty folder
+            </div>
+          ) : (
+            node.children.map((child) => (
+              <TreeItem
+                key={child.id}
+                node={child}
+                depth={depth + 1}
+                activePath={activePath}
+                onOpenFile={onOpenFile}
+                onCreateFile={onCreateFile}
+                onCreateDir={onCreateDir}
+                onRename={onRename}
+                onDelete={onDelete}
+                onContextMenu={onContextMenu}
+                onExpandFolder={onExpandFolder}
+              />
+            ))
+          )}
         </div>
       )}
     </div>
@@ -142,6 +177,7 @@ export function ProjectExplorer({
   onRename,
   onDelete,
   onRefresh,
+  onExpandFolder,
 }: Props) {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -250,6 +286,7 @@ export function ProjectExplorer({
           onRename={onRename}
           onDelete={onDelete}
           onContextMenu={setMenu}
+          onExpandFolder={onExpandFolder}
         />
       ))}
 

@@ -38,6 +38,7 @@ interface Props {
   onCreateDir: (parentDir: string) => void;
   onRenameNode: (node: FileNode) => void;
   onDeleteNode: (node: FileNode) => void;
+  onExpandFolder: (folderPath: string) => void;
 }
 
 const sections: { id: SidebarSection; label: string; icon: typeof FolderTree }[] = [
@@ -69,6 +70,7 @@ export function Sidebar({
   onCreateDir,
   onRenameNode,
   onDeleteNode,
+  onExpandFolder,
 }: Props) {
   return (
     <div className="flex h-full min-w-0">
@@ -142,6 +144,7 @@ export function Sidebar({
                   onRename={onRenameNode}
                   onDelete={onDeleteNode}
                   onRefresh={onRefreshTree}
+                  onExpandFolder={onExpandFolder}
                 />
               ) : (
                 <div className="px-3 py-4 text-2xs text-surface-400">

@@ -192,6 +192,75 @@ export function useWorkspace() {
     }
   }, [loadTree]);
 
+  // --- Lazy folder expansion ---
+  // Tracks in-flight requests by folder path to prevent duplicate fetches.
+  const loadingFoldersRef = useRef<Set<string>>(new Set());
+
+  const loadFolderChildren = useCallback(
+    async (folderPath: string) => {
+      const project = activeProjectRef.current;
+      console.log('[WORKSPACE-DEBUG] lazy_load_start', {
+        folderPath,
+        projectId: project?.id ?? null,
+        hasWorkspace: !!project?.workspacePath,
+        alreadyLoading: loadingFoldersRef.current.has(folderPath),
+      });
+      if (!project || !project.workspacePath) {
+        console.warn('[WORKSPACE-DEBUG] lazy_load_skip', { reason: 'no_project_or_workspace', folderPath });
+        return;
+      }
+      if (loadingFoldersRef.current.has(folderPath)) {
+        console.log('[WORKSPACE-DEBUG] lazy_load_skip', { reason: 'already_in_flight', folderPath });
+        return;
+      }
+      loadingFoldersRef.current.add(folderPath);
+
+      try {
+        console.log('[WORKSPACE-DEBUG] api_request', {
+          endpoint: 'listTree',
+          projectId: project.id,
+          subpath: folderPath,
+          depth: 1,
+        });
+        const children = await workspaceService.listTree(project.id, folderPath, 1);
+        console.log('[WORKSPACE-DEBUG] api_response', {
+          folderPath,
+          childCount: children.length,
+          childIds: children.map((c) => c.id),
+        });
+        setTree((prev) => {
+          const updateNode = (nodes: FileNode[]): FileNode[] =>
+            nodes.map((n) => {
+              if (n.id === folderPath && n.type === 'folder') {
+                return { ...n, children };
+              }
+              if (n.children) {
+                return { ...n, children: updateNode(n.children) };
+              }
+              return n;
+            });
+          const next = updateNode(prev);
+          console.log('[WORKSPACE-DEBUG] tree_update', {
+            folderPath,
+            treeChanged: next !== prev,
+          });
+          return next;
+        });
+      } catch (e) {
+        const msg = e instanceof ApiErrorClass ? e.message : 'Failed to load folder contents';
+        console.error('[WORKSPACE-DEBUG] lazy_load_error', {
+          folderPath,
+          error: msg,
+          rawError: e,
+        });
+        setError(msg);
+      } finally {
+        loadingFoldersRef.current.delete(folderPath);
+      }
+    },
+    [],
+  );
+
   const clearError = useCallback(() => setError(null), []);
 
   return {
@@ -208,6 +277,7 @@ export function useWorkspace() {
     openProject,
     loadTree,
     refreshTree,
+    loadFolderChildren,
     openFile,
     closeTab,
     updateTabContent,

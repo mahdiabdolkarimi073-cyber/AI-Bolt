@@ -192,6 +192,40 @@ describe('workspaceService.listTree', () => {
     const [path] = requestMock.mock.calls[0];
     expect(path).toBe('/workspace/p1/tree');
   });
+
+  it('sends nested subpath for lazy folder expansion', async () => {
+    requestMock.mockResolvedValue(ok([
+      { id: 'app/crm/page.tsx', name: 'page.tsx', type: 'file', language: 'tsx' },
+    ]));
+    const result = await workspaceService.listTree('p1', 'app/crm', 1);
+    const [path] = requestMock.mock.calls[0];
+    expect(path).toContain('subpath=app%2Fcrm');
+    expect(path).toContain('depth=1');
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe('app/crm/page.tsx');
+  });
+
+  it('sends deeply nested subpath for multi-level lazy loading', async () => {
+    requestMock.mockResolvedValue(ok([
+      { id: 'app/crm/customers/[id]/page.tsx', name: 'page.tsx', type: 'file', language: 'tsx' },
+    ]));
+    await workspaceService.listTree('p1', 'app/crm/customers/[id]', 1);
+    const [path] = requestMock.mock.calls[0];
+    expect(path).toContain('subpath=app');
+    expect(path).toContain('crm');
+    expect(path).toContain('customers');
+  });
+
+  it('returns empty array when backend returns null data', async () => {
+    requestMock.mockResolvedValue({ data: null, error: null });
+    const result = await workspaceService.listTree('p1', 'empty-dir', 1);
+    expect(result).toEqual([]);
+  });
+
+  it('throws on backend error for lazy load', async () => {
+    requestMock.mockResolvedValue(err('not_found', 'Directory not found.', 404));
+    await expect(workspaceService.listTree('p1', 'missing', 1)).rejects.toThrow(/Directory not found/);
+  });
 });
 
 describe('workspaceService.renamePath', () => {

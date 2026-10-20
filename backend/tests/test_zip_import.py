@@ -164,3 +164,103 @@ class TestInvalidArchive:
         raw = b"PK" + b"\x00" * 30
         r = _post_zip(client, raw, name="corrupt")
         assert r.status_code == 400
+
+
+class TestZipRootDetectionRegression:
+    """Regression tests for order-independent root detection and
+    directory entries without trailing slashes."""
+
+    def test_single_root_dir_entry_without_trailing_slash(self, client: TestClient, env: Path):
+        """Directory entry 'myproj' (no trailing slash) should still be
+        detected as a single root so files are not double-nested."""
+        raw = _make_zip(
+            entries=[
+                ("myproj/README.md", b"# hi"),
+                ("myproj/src/main.py", b"print('hi')"),
+            ],
+            dirs=["myproj", "myproj/src"],  # no trailing slashes
+        )
+        r = _post_zip(client, raw, name="test-no-slash")
+        assert r.status_code == 201, r.text
+        wp = r.json()["workspacePath"]
+        assert wp == "myproj"
+        # Files should be directly under myproj, not myproj/myproj/...
+        assert (env / wp / "README.md").read_text() == "# hi"
+        assert (env / wp / "src" / "main.py").exists()
+        assert not (env / wp / "myproj").exists(), "Root was not stripped — double nesting occurred"
+
+    def test_files_before_dir_entries(self, client: TestClient, env: Path):
+        """Files appearing before directory entries must not break root
+        detection. The first entry is a file at depth 2, not a dir entry."""
+        raw = _make_zip(
+            entries=[
+                ("app/crm/page.tsx", b"export default function Page() {}"),
+                ("app/crm/customers/[id]/page.tsx", b"export default function IdPage() {}"),
+                ("app/layout.tsx", b"export const Layout = () => null;"),
+            ],
+            dirs=["app", "app/crm", "app/crm/customers", "app/crm/customers/[id]"],
+        )
+        r = _post_zip(client, raw, name="nested-proj")
+        assert r.status_code == 201, r.text
+        wp = r.json()["workspacePath"]
+        assert wp == "app"
+        # Deeply nested file should exist at the right depth.
+        assert (env / wp / "crm" / "page.tsx").exists()
+        assert (env / wp / "crm" / "customers" / "[id]" / "page.tsx").exists()
+        assert (env / wp / "layout.tsx").exists()
+
+    def test_no_double_root_nesting(self, client: TestClient, env: Path):
+        """A single-root zip with trailing-slash dir entries should not
+        create an extra nested copy of the root folder."""
+        raw = _make_zip(
+            entries=[
+                ("proj/src/index.ts", b"export {};"),
+                ("proj/package.json", b'{"name":"proj"}'),
+            ],
+            dirs=["proj/", "proj/src/"],
+        )
+        r = _post_zip(client, raw, name="nest-check")
+        assert r.status_code == 201, r.text
+        wp = r.json()["workspacePath"]
+        assert wp == "proj"
+        assert (env / wp / "src" / "index.ts").exists()
+        assert (env / wp / "package.json").exists()
+        # No double-nested proj/proj directory.
+        assert not (env / wp / "proj").exists()
+
+    def test_nested_structure_crm(self, client: TestClient, env: Path):
+        """The exact scenario from the bug report: app/crm appears but its
+        contents are missing. After the fix, deep children must be on disk."""
+        raw = _make_zip(
+            entries=[
+                ("app/crm/page.tsx", b"// crm page"),
+                ("app/crm/layout.tsx", b"// crm layout"),
+                ("app/crm/customers/[id]/page.tsx", b"// customer detail"),
+                ("app/api/route.ts", b"// api route"),
+            ],
+            dirs=["app/", "app/crm/", "app/crm/customers/", "app/crm/customers/[id]/", "app/api/"],
+        )
+        r = _post_zip(client, raw, name="crm-app")
+        assert r.status_code == 201, r.text
+        wp = r.json()["workspacePath"]
+        # Verify all deeply nested files exist.
+        assert (env / wp / "crm" / "page.tsx").exists()
+        assert (env / wp / "crm" / "layout.tsx").exists()
+        assert (env / wp / "crm" / "customers" / "[id]" / "page.tsx").exists()
+        assert (env / wp / "api" / "route.ts").exists()
+
+    def test_flat_zip_no_false_single_root(self, client: TestClient, env: Path):
+        """A flat zip with multiple top-level files should NOT be treated as
+        single-root — it should create a wrapper directory."""
+        raw = _make_zip([
+            ("README.md", b"# a"),
+            ("index.ts", b"export {};"),
+            ("package.json", b'{}'),
+        ])
+        r = _post_zip(client, raw, name="flat-multi")
+        assert r.status_code == 201, r.text
+        wp = r.json()["workspacePath"]
+        # Should use the sanitized name, not a top-level file name.
+        assert wp == "flat-multi"
+        assert (env / wp / "README.md").exists()
+        assert (env / wp / "index.ts").exists()

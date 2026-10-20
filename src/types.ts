@@ -11,7 +11,8 @@ export interface FileNode {
   id: string;
   name: string;
   type: 'file' | 'folder';
-  children?: FileNode[];
+  /** Undefined = unknown (never fetched). Null = fetched, folder is lazy (children not yet loaded). */
+  children?: FileNode[] | null;
   language?: string;
 }
 

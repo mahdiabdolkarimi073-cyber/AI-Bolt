@@ -125,6 +125,43 @@ class TestTree:
         names = {n["name"] for n in r.json()}
         assert "a.ts" in names and "b.ts" in names
 
+    def test_lists_nested_subpath(self, client: TestClient, project_id: str):
+        """Listing a subpath should return one level of its children."""
+        client.post(f"/workspace/{project_id}/files", json={"path": "app/crm/page.tsx", "content": "x"})
+        client.post(f"/workspace/{project_id}/files", json={"path": "app/crm/layout.tsx", "content": "x"})
+        client.post(f"/workspace/{project_id}/files", json={"path": "app/api/route.ts", "content": "x"})
+        # List app/ at depth 1.
+        r = client.get(f"/workspace/{project_id}/tree", params={"subpath": "app", "depth": 1})
+        assert r.status_code == 200, r.text
+        names = {n["name"] for n in r.json()}
+        assert "crm" in names and "api" in names
+        # Folders at depth 1 have children=null (lazy).
+        crm = next(n for n in r.json() if n["name"] == "crm")
+        assert crm["children"] is None
+
+    def test_lists_deep_subpath(self, client: TestClient, project_id: str):
+        """Listing a deeply nested subpath returns its direct children."""
+        client.post(f"/workspace/{project_id}/files", json={"path": "app/crm/customers/[id]/page.tsx", "content": "x"})
+        client.post(f"/workspace/{project_id}/files", json={"path": "app/crm/customers/list.tsx", "content": "x"})
+        r = client.get(f"/workspace/{project_id}/tree", params={"subpath": "app/crm/customers", "depth": 1})
+        assert r.status_code == 200, r.text
+        names = {n["name"] for n in r.json()}
+        assert "[id]" in names and "list.tsx" in names
+
+    def test_depth_2_expands_one_level(self, client: TestClient, project_id: str):
+        """depth=2 should expand folders one level deep with children populated."""
+        client.post(f"/workspace/{project_id}/files", json={"path": "src/a.ts", "content": "x"})
+        client.post(f"/workspace/{project_id}/files", json={"path": "src/sub/b.ts", "content": "x"})
+        r = client.get(f"/workspace/{project_id}/tree", params={"depth": 2})
+        assert r.status_code == 200, r.text
+        src = next(n for n in r.json() if n["name"] == "src")
+        assert src["children"] is not None
+        child_names = {c["name"] for c in src["children"]}
+        assert "a.ts" in child_names and "sub" in child_names
+        # sub should have children=null (only 2 levels deep).
+        sub = next(c for c in src["children"] if c["name"] == "sub")
+        assert sub["children"] is None
+
 
 class TestSearch:
     def test_filename_search(self, client: TestClient, project_id: str):
