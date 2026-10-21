@@ -136,3 +136,25 @@ export interface TerminalLine {
   text: string;
   ts: number;
 }
+
+// --- Preview server types ---
+
+export type PreviewState = 'idle' | 'starting' | 'running' | 'error' | 'stopped';
+
+export interface PreviewStatus {
+  projectId: string;
+  state: PreviewState;
+  url?: string | null;
+  sessionId?: string | null;
+  command?: string | null;
+  error?: string | null;
+  runtime?: string | null;
+  framework?: string | null;
+}
+
+export interface PreviewLogsResponse {
+  projectId: string;
+  stdout: string;
+  stderr: string;
+  lines: Array<{ stream: string; text: string }>;
+}

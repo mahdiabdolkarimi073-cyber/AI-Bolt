@@ -14,6 +14,7 @@ import { ErrorBoundary } from './ErrorBoundary';
 import { useAgentChat } from '@/hooks/useAgentChat';
 import { useWorkspace, type OpenFileTab } from '@/hooks/useWorkspace';
 import { useTerminal } from '@/hooks/useTerminal';
+import { usePreview } from '@/hooks/usePreview';
 import { useConnections } from '@/hooks/useConnections';
 import { config } from '@/config';
 import { getRepositories } from '@/services/index';
@@ -203,9 +204,17 @@ export function AppShell() {
       // newly created/modified files appear immediately.
       if (result?.toolsExecuted && result.toolsExecuted.length > 0) {
         await workspace.refreshTree();
+        // Auto-start preview if the agent finished successfully and no preview
+        // server is currently running. Switch to the Preview tab so the user
+        // sees the server starting.
+        if (result.status === 'completed' && preview.state === 'idle' && !preview.starting) {
+          setBottomTab('preview');
+          setBottomOpen(true);
+          void preview.start();
+        }
       }
     },
-    [agent, conversationId, conversationIdRef, projectId, workspace],
+    [agent, conversationId, conversationIdRef, projectId, workspace, preview],
   );
 
   const handleStop = useCallback(() => {
@@ -231,6 +240,7 @@ export function AppShell() {
   const [bottomHeight, setBottomHeight] = useState(240);
 
   const terminal = useTerminal(projectId);
+  const preview = usePreview(projectId);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [projectDialog, setProjectDialog] = useState<{ open: boolean; mode: 'open' | 'new' }>({
@@ -478,6 +488,7 @@ export function AppShell() {
             activeTab={bottomTab}
             onTabChange={setBottomTab}
             terminal={terminal}
+            preview={preview}
             height={bottomHeight}
           />
         </div>

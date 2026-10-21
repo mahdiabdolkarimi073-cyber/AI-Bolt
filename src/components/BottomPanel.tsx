@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import {
   Terminal as TerminalIcon,
   AlertTriangle,
@@ -13,11 +13,14 @@ import {
   CheckCircle2,
   XCircle,
   Loader2,
+  Play,
+  Square,
 } from 'lucide-react';
 import type { BottomTab } from '@/types';
 import { sampleProblems } from '@/data/mock';
 import { TerminalPanel } from './TerminalPanel';
 import type { UseTerminalResult } from '@/hooks/useTerminal';
+import type { UsePreviewResult } from '@/hooks/usePreview';
 
 interface Props {
   open: boolean;
@@ -25,6 +28,7 @@ interface Props {
   activeTab: BottomTab;
   onTabChange: (t: BottomTab) => void;
   terminal: UseTerminalResult;
+  preview: UsePreviewResult;
   height: number;
 }
 
@@ -36,12 +40,7 @@ const tabs: { id: BottomTab; label: string; icon: typeof TerminalIcon }[] = [
   { id: 'tests', label: 'Tests', icon: FlaskConical },
 ];
 
-export function BottomPanel({ open, onToggle, activeTab, onTabChange, terminal, height }: Props) {
-  // Find a preview URL from any running long-running session.
-  const previewSession = terminal.sessions.find(
-    (s) => s.previewUrl && (s.status === 'running' || s.status === 'pending'),
-  ) ?? terminal.sessions.find((s) => s.previewUrl);
-  const previewUrl = previewSession?.previewUrl ?? null;
+export function BottomPanel({ open, onToggle, activeTab, onTabChange, terminal, preview, height }: Props) {
 
   // Live test sessions
   const testSessions = terminal.sessions.filter((s) => s.kind === 'test');
@@ -114,7 +113,7 @@ export function BottomPanel({ open, onToggle, activeTab, onTabChange, terminal, 
       {open && (
         <div className="min-h-0 flex-1 overflow-hidden">
           {activeTab === 'terminal' && <TerminalPanel terminal={terminal} height={height - 32} />}
-          {activeTab === 'preview' && <PreviewView url={previewUrl} />}
+          {activeTab === 'preview' && <PreviewView preview={preview} />}
           {activeTab === 'problems' && (
             <div className="h-full overflow-auto scrollbar-thin">
               <ProblemsView />
@@ -138,65 +137,227 @@ export function BottomPanel({ open, onToggle, activeTab, onTabChange, terminal, 
 
 // --- Preview tab ---
 
-function PreviewView({ url }: { url: string | null }) {
-  const [key, setKey] = useState(0);
+function PreviewView({ preview }: { preview: UsePreviewResult }) {
+  const [iframeKey, setIframeKey] = useState(0);
   const [iframeBlocked, setIframeBlocked] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const { state, url, command, error, starting, stopping, available } = preview;
 
-  if (!url) {
+  // Reset iframe blocked state when URL changes.
+  useEffect(() => {
+    setIframeBlocked(false);
+  }, [url]);
+
+  const isRunning = state === 'running' || state === 'starting';
+
+  const statusBadge = (() => {
+    switch (state) {
+      case 'running':
+        return { label: 'Running', color: 'text-success-500', icon: CheckCircle2 };
+      case 'starting':
+        return { label: 'Starting...', color: 'text-accent-400', icon: Loader2 };
+      case 'error':
+        return { label: 'Error', color: 'text-error-400', icon: XCircle };
+      case 'stopped':
+        return { label: 'Stopped', color: 'text-surface-400', icon: Square };
+      default:
+        return { label: 'Idle', color: 'text-surface-400', icon: Monitor };
+    }
+  })();
+  const StatusIcon = statusBadge.icon;
+
+  // --- No project / backend unavailable ---
+  if (!available) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-2xs text-surface-400">
         <Monitor size={22} className="text-surface-500" />
-        <p className="font-medium text-surface-300">No preview available</p>
-        <p>Start a dev server from the Terminal tab. Once it prints a local URL, the preview will appear here automatically.</p>
+        <p className="font-medium text-surface-300">Preview unavailable</p>
+        <p>The local backend is not configured. Preview requires the backend to run dev servers.</p>
       </div>
     );
   }
 
+  // --- Idle / stopped state with start button ---
+  if (state === 'idle' || state === 'stopped') {
+    return (
+      <div className="flex h-full flex-col">
+        {/* toolbar */}
+        <div className="flex h-8 shrink-0 items-center gap-2 border-b border-surface-800 bg-surface-900 px-2">
+          <div className="flex items-center gap-1.5 text-2xs text-surface-300">
+            <StatusIcon size={13} className={statusBadge.color} />
+            <span className={statusBadge.color}>{statusBadge.label}</span>
+          </div>
+          <div className="ml-auto flex items-center gap-1">
+            <button
+              onClick={() => void preview.start()}
+              disabled={starting}
+              className="inline-flex items-center gap-1.5 rounded-md border border-accent-500/40 bg-accent-500/10 px-2.5 py-1 text-2xs font-medium text-accent-300 transition-colors hover:bg-accent-500/20 disabled:opacity-50"
+              title="Start dev server"
+            >
+              {starting ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
+              Start Preview
+            </button>
+          </div>
+        </div>
+        {error && state === 'stopped' && (
+          <div className="border-b border-error-500/20 bg-error-500/5 px-3 py-1.5 text-2xs text-error-400">
+            {error}
+          </div>
+        )}
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-2xs text-surface-400">
+          <Monitor size={22} className="text-surface-500" />
+          <p className="font-medium text-surface-300">No preview running</p>
+          <p>Click "Start Preview" to detect the project runtime and launch its dev server. The preview will appear here once the server is ready.</p>
+          {preview.runtime && (
+            <p className="mt-1 text-surface-500">Detected: {preview.runtime}{preview.framework ? ` / ${preview.framework}` : ''}</p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // --- Error state ---
+  if (state === 'error') {
+    return (
+      <div className="flex h-full flex-col">
+        <div className="flex h-8 shrink-0 items-center gap-2 border-b border-surface-800 bg-surface-900 px-2">
+          <div className="flex items-center gap-1.5 text-2xs text-surface-300">
+            <StatusIcon size={13} className={statusBadge.color} />
+            <span className={statusBadge.color}>{statusBadge.label}</span>
+          </div>
+          <div className="ml-auto flex items-center gap-1">
+            <button
+              onClick={() => void preview.start()}
+              disabled={starting}
+              className="inline-flex items-center gap-1.5 rounded-md border border-accent-500/40 bg-accent-500/10 px-2.5 py-1 text-2xs font-medium text-accent-300 transition-colors hover:bg-accent-500/20 disabled:opacity-50"
+              title="Restart dev server"
+            >
+              {starting ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
+              Restart
+            </button>
+            <button
+              onClick={() => setShowLogs((s) => !s)}
+              className="rounded p-1 text-surface-400 transition-colors hover:bg-surface-750 hover:text-gray-100"
+              title="Toggle logs"
+            >
+              <ScrollText size={13} />
+            </button>
+          </div>
+        </div>
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-2xs text-surface-400">
+          <XCircle size={22} className="text-error-400" />
+          <p className="font-medium text-error-400">Preview failed to start</p>
+          {error && (
+            <div className="mt-1 max-h-32 overflow-auto rounded border border-surface-800 bg-surface-850 px-3 py-2 font-mono text-[11px] text-error-400/90 scrollbar-thin">
+              {error}
+            </div>
+          )}
+          {showLogs && preview.logs.length > 0 && (
+            <div className="mt-2 max-h-40 w-full max-w-2xl overflow-auto rounded border border-surface-800 bg-surface-850 px-3 py-2 font-mono text-[10px] leading-relaxed scrollbar-thin">
+              {preview.logs.slice(-80).map((l, i) => (
+                <div key={i} className={l.stream === 'stderr' ? 'text-error-400/80' : 'text-surface-300'}>
+                  {l.text || '\u00A0'}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // --- Running / starting state ---
   return (
     <div className="flex h-full flex-col">
       {/* toolbar */}
       <div className="flex h-8 shrink-0 items-center gap-2 border-b border-surface-800 bg-surface-900 px-2">
+        <div className="flex items-center gap-1.5 text-2xs text-surface-300">
+          <StatusIcon size={13} className={`${statusBadge.color} ${state === 'starting' ? 'animate-spin' : ''}`} />
+          <span className={statusBadge.color}>{statusBadge.label}</span>
+        </div>
         <div className="flex-1 truncate rounded border border-surface-700 bg-surface-800 px-2 py-0.5 font-mono text-[11px] text-surface-300">
-          {url}
+          {url ?? (state === 'starting' ? 'Waiting for server...' : command ?? '')}
         </div>
         <button
           title="Refresh preview"
-          onClick={() => { setKey((k) => k + 1); setIframeBlocked(false); }}
-          className="rounded p-1 text-surface-400 transition-colors hover:bg-surface-750 hover:text-gray-100"
+          onClick={() => { setIframeKey((k) => k + 1); setIframeBlocked(false); }}
+          disabled={!url}
+          className="rounded p-1 text-surface-400 transition-colors hover:bg-surface-750 hover:text-gray-100 disabled:opacity-30"
         >
           <RefreshCw size={13} />
         </button>
-        <a
-          href={url}
-          target="_blank"
-          rel="noreferrer"
-          title="Open in browser"
-          className="rounded p-1 text-surface-400 transition-colors hover:bg-surface-750 hover:text-gray-100"
+        {url && (
+          <a
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            title="Open in browser"
+            className="rounded p-1 text-surface-400 transition-colors hover:bg-surface-750 hover:text-gray-100"
+          >
+            <ExternalLink size={13} />
+          </a>
+        )}
+        <button
+          onClick={() => setShowLogs((s) => !s)}
+          className={`rounded p-1 transition-colors hover:bg-surface-750 hover:text-gray-100 ${showLogs ? 'text-accent-400' : 'text-surface-400'}`}
+          title="Toggle logs"
         >
-          <ExternalLink size={13} />
-        </a>
+          <ScrollText size={13} />
+        </button>
+        <button
+          onClick={() => void preview.stop()}
+          disabled={stopping}
+          className="rounded p-1 text-error-400 transition-colors hover:bg-error-500/10 disabled:opacity-50"
+          title="Stop server"
+        >
+          {stopping ? <Loader2 size={13} className="animate-spin" /> : <Square size={13} />}
+        </button>
       </div>
+
+      {/* logs panel (toggleable) */}
+      {showLogs && (
+        <div className="max-h-32 shrink-0 overflow-auto border-b border-surface-800 bg-surface-950 px-2 py-1 font-mono text-[10px] leading-relaxed scrollbar-thin">
+          {preview.logs.length === 0 ? (
+            <div className="px-1 py-1 text-surface-500">No output yet.</div>
+          ) : (
+            preview.logs.slice(-100).map((l, i) => (
+              <div key={i} className={l.stream === 'stderr' ? 'text-error-400/80' : 'text-surface-300'}>
+                {l.text || '\u00A0'}
+              </div>
+            ))
+          )}
+        </div>
+      )}
 
       {/* iframe / fallback */}
       <div className="relative min-h-0 flex-1 bg-white">
-        {iframeBlocked ? (
+        {state === 'starting' && !url ? (
+          <div className="flex h-full flex-col items-center justify-center gap-2 bg-surface-900 px-6 text-center text-2xs text-surface-400">
+            <Loader2 size={22} className="animate-spin text-accent-400" />
+            <p className="font-medium text-surface-300">Starting dev server...</p>
+            <p className="text-surface-500">{command}</p>
+            <p>Waiting for the server to print its local URL.</p>
+          </div>
+        ) : iframeBlocked ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 bg-surface-900 px-6 text-center text-2xs text-surface-400">
             <ShieldAlert size={20} className="text-warning-500" />
             <p className="font-medium text-surface-300">Preview blocked by the server</p>
             <p>The development server sent an <code className="font-mono text-surface-300">X-Frame-Options</code> or <code className="font-mono text-surface-300">Content-Security-Policy</code> header that prevents embedding. Use the button above to open it in your browser instead.</p>
-            <a
-              href={url}
-              target="_blank"
-              rel="noreferrer"
-              className="mt-1 inline-flex items-center gap-1.5 rounded-md border border-accent-500/40 bg-accent-500/10 px-3 py-1.5 text-xs font-medium text-accent-300 transition-colors hover:bg-accent-500/20"
-            >
-              <ExternalLink size={13} /> Open in browser
-            </a>
+            {url && (
+              <a
+                href={url}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-1 inline-flex items-center gap-1.5 rounded-md border border-accent-500/40 bg-accent-500/10 px-3 py-1.5 text-xs font-medium text-accent-300 transition-colors hover:bg-accent-500/20"
+              >
+                <ExternalLink size={13} /> Open in browser
+              </a>
+            )}
           </div>
-        ) : (
+        ) : url ? (
           <iframe
-            key={key}
+            key={iframeKey}
             ref={iframeRef}
             src={url}
             title="Live preview"
@@ -204,6 +365,11 @@ function PreviewView({ url }: { url: string | null }) {
             onError={() => setIframeBlocked(true)}
             sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
           />
+        ) : (
+          <div className="flex h-full flex-col items-center justify-center gap-2 bg-surface-900 px-6 text-center text-2xs text-surface-400">
+            <Monitor size={22} className="text-surface-500" />
+            <p className="font-medium text-surface-300">Waiting for server URL...</p>
+          </div>
         )}
       </div>
     </div>

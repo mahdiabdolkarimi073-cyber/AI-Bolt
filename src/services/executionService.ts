@@ -11,6 +11,8 @@ import type {
   DiagnoseRequest,
   DiagnoseResponse,
   ExecSessionSummary,
+  PreviewLogsResponse,
+  PreviewStatus,
   RuntimeDetectionResponse,
   SessionOutputResponse,
   StartSessionRequest,
@@ -129,5 +131,42 @@ export const executionService = {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'stop' }));
     }
+  },
+
+  // --- Preview server management ---
+
+  async startPreview(projectId: string, opts?: { commandOverride?: string; workingSubdir?: string }): Promise<PreviewStatus> {
+    const { data, error } = await request<PreviewStatus>(
+      `/preview/start/${encodeURIComponent(projectId)}`,
+      { method: 'POST', body: { commandOverride: opts?.commandOverride ?? null, workingSubdir: opts?.workingSubdir ?? '' } },
+    );
+    if (error) throw new ApiErrorClass(error.code, error.message, error.status);
+    if (!data) throw new ApiErrorClass('server', 'Empty response from backend.', 500);
+    return data;
+  },
+
+  async stopPreview(projectId: string): Promise<PreviewStatus> {
+    const { data, error } = await request<PreviewStatus>(
+      `/preview/stop/${encodeURIComponent(projectId)}`,
+      { method: 'POST' },
+    );
+    if (error) throw new ApiErrorClass(error.code, error.message, error.status);
+    return data ?? { projectId, state: 'idle' };
+  },
+
+  async getPreviewStatus(projectId: string): Promise<PreviewStatus> {
+    const { data, error } = await request<PreviewStatus>(
+      `/preview/status/${encodeURIComponent(projectId)}`,
+    );
+    if (error) throw new ApiErrorClass(error.code, error.message, error.status);
+    return data ?? { projectId, state: 'idle' };
+  },
+
+  async getPreviewLogs(projectId: string): Promise<PreviewLogsResponse> {
+    const { data, error } = await request<PreviewLogsResponse>(
+      `/preview/logs/${encodeURIComponent(projectId)}`,
+    );
+    if (error) throw new ApiErrorClass(error.code, error.message, error.status);
+    return data ?? { projectId, stdout: '', stderr: '', lines: [] };
   },
 };

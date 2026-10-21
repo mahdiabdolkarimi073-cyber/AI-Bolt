@@ -961,10 +961,13 @@ class GeminiAdapter:
                         break
                     for entry in tc:
                         fc_part: dict = {"name": entry["name"], "args": entry.get("args", {})}
+                        part: dict = {"functionCall": fc_part}
                         thought_sig = entry.get("thought_signature")
                         if isinstance(thought_sig, str) and thought_sig:
-                            fc_part["thoughtSignature"] = thought_sig
-                        parts.append({"functionCall": fc_part})
+                            # thoughtSignature is a sibling of functionCall on
+                            # the Part object, not a nested field inside it.
+                            part["thoughtSignature"] = thought_sig
+                        parts.append(part)
                     i += 1
                 contents.append({"role": "model", "parts": parts})
                 _sig_count = sum(1 for p in parts if isinstance(p, dict) and isinstance(p.get("functionCall", {}).get("thoughtSignature"), str))
@@ -1035,7 +1038,12 @@ class GeminiAdapter:
                 continue
             name = fc.get("name")
             args = fc.get("args")
-            thought_sig = fc.get("thoughtSignature") or fc.get("thought_signature")
+            # thoughtSignature is a sibling of functionCall on the Part object,
+            # not a nested field inside functionCall.  Check the part level first,
+            # then fall back to the functionCall level for proxy/SDK variants.
+            thought_sig = p.get("thoughtSignature") or p.get("thought_signature")
+            if not thought_sig:
+                thought_sig = fc.get("thoughtSignature") or fc.get("thought_signature")
             if isinstance(name, str) and name:
                 sig_val = thought_sig if isinstance(thought_sig, str) and thought_sig else None
                 if sig_val:
