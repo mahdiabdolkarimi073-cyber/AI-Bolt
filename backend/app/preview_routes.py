@@ -15,6 +15,7 @@ can poll status without searching through all sessions.
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, status
@@ -29,6 +30,14 @@ from app.execution import (
     resolve_project_root,
     validate_working_dir,
 )
+from app.port_manager import (
+    ReservedPortError,
+    allocate_port,
+    inject_port_into_command,
+    is_reserved,
+    release_port,
+    release_session,
+)
 from app.runtime_detect import detect_runtime, infer_commands, preview_url_from_output
 from app.utils import now_ms
 
@@ -38,6 +47,8 @@ router = APIRouter(prefix="/preview", tags=["preview"])
 # In-memory mapping: project_id -> session_id
 # (Lost on restart, which is fine — orphaned sessions are marked stopped on startup.)
 _preview_sessions: dict[str, str] = {}
+# Track allocated port per session so we can release it on stop.
+_session_ports: dict[str, int] = {}
 
 
 class PreviewStatus(BaseModel):
@@ -54,6 +65,10 @@ class PreviewStatus(BaseModel):
 class StartPreviewRequest(BaseModel):
     commandOverride: Optional[str] = None
     workingSubdir: str = ""
+
+
+class NoFreePortError(HTTPException):
+    pass
 
 
 @router.post("/start/{project_id}", response_model=PreviewStatus)
@@ -105,8 +120,30 @@ async def start_preview(project_id: str, body: StartPreviewRequest = StartPrevie
     cwd = validate_working_dir(root, body.workingSubdir or "")
 
     # Generate a session id.
-    import uuid
     session_id = f"pv-{uuid.uuid4().hex[:12]}"
+
+    # Allocate a free, non-reserved port and inject it into the command.
+    # Ports 5173 and 8000 are reserved for AI-Bolt itself and must never be
+    # used by a preview server, regardless of the project's own config.
+    try:
+        allocated_port = allocate_port(session_id)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "no_free_port", "message": str(exc)},
+        )
+
+    try:
+        run_cmd = inject_port_into_command(run_cmd, allocated_port, runtime.framework)
+    except ReservedPortError as exc:
+        release_port(allocated_port)
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail={"code": "reserved_port", "message": str(exc)},
+        )
+
+    # Also set PORT env var as a fallback for frameworks that read it.
+    env_extra = {"PORT": str(allocated_port)}
 
     session = await process_manager.start(
         session_id=session_id,
@@ -118,7 +155,10 @@ async def start_preview(project_id: str, body: StartPreviewRequest = StartPrevie
         source="user",
         long_running=True,
         timeout_s=None,
+        env_extra=env_extra,
     )
+
+    _session_ports[session_id] = allocated_port
 
     _preview_sessions[project_id] = session_id
 
@@ -153,9 +193,14 @@ async def stop_preview(project_id: str):
     session = process_manager.get(sid)
     if not session:
         _preview_sessions.pop(project_id, None)
+        release_session(sid)
+        _session_ports.pop(sid, None)
         return PreviewStatus(projectId=project_id, state="idle")
     if session.status in ("running", "pending"):
         await process_manager.stop(sid)
+    # Release the allocated port back to the pool.
+    release_session(sid)
+    _session_ports.pop(sid, None)
     return _build_status(project_id, sid, process_manager.get(sid))
 
 
@@ -201,6 +246,15 @@ def get_preview_logs(project_id: str, tail: int = 200):
 def _build_status(project_id: str, session_id: str, session) -> PreviewStatus:
     out = session.output.get_text()
     url = preview_url_from_output(out["stdout"] + "\n" + out["stderr"])
+
+    # Validate extracted URL: if the server somehow bound to a reserved
+    # port (e.g. ignored our --port flag), mark the session as error so the
+    # user is not pointed at AI-Bolt's own frontend/backend.
+    if url:
+        for reserved in (5173, 8000):
+            if f":{reserved}" in url:
+                url = None
+                break
 
     state = "starting"
     if session.status == "running":
@@ -248,7 +302,10 @@ def _build_status(project_id: str, session_id: str, session) -> PreviewStatus:
 
 def clear_preview_session(project_id: str) -> None:
     """Called when a project is closed or switched to clean up the in-memory mapping."""
-    _preview_sessions.pop(project_id, None)
+    sid = _preview_sessions.pop(project_id, None)
+    if sid:
+        release_session(sid)
+        _session_ports.pop(sid, None)
 
 
 def init_preview_table() -> None:

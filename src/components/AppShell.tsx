@@ -185,6 +185,13 @@ export function AppShell() {
     onProjectCreated: handleAgentProjectCreated,
   });
 
+  const terminal = useTerminal(projectId);
+  const preview = usePreview(projectId);
+
+  const [bottomOpen, setBottomOpen] = useState(true);
+  const [bottomTab, setBottomTab] = useState<BottomTab>('terminal');
+  const [bottomHeight, setBottomHeight] = useState(240);
+
   const [simulatedIds, setSimulatedIds] = useState<Set<string>>(new Set());
 
   const handleSend = useCallback(
@@ -234,13 +241,6 @@ export function AppShell() {
   const chatConnectionLabel = activeConn?.displayName ?? 'No connection';
   const chatModelLabel = activeModelId ?? 'No model';
   const chatConnected = activeConn?.status === 'connected';
-
-  const [bottomOpen, setBottomOpen] = useState(true);
-  const [bottomTab, setBottomTab] = useState<BottomTab>('terminal');
-  const [bottomHeight, setBottomHeight] = useState(240);
-
-  const terminal = useTerminal(projectId);
-  const preview = usePreview(projectId);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [projectDialog, setProjectDialog] = useState<{ open: boolean; mode: 'open' | 'new' }>({

@@ -426,6 +426,12 @@ class ProcessManager:
             pass
         await session.queue.put({"type": "end", "exitCode": code, "status": session.status})
         await _persist_session_end(session)
+        # Release any allocated preview port.
+        try:
+            from app.port_manager import release_session
+            release_session(session.id)
+        except Exception:
+            pass
 
     async def _terminate(self, session: Session) -> None:
         proc = session.proc
@@ -471,6 +477,12 @@ class ProcessManager:
         session.finished_at = int(time.time() * 1000)
         await session.queue.put({"type": "stopped"})
         await _persist_session_end(session)
+        # Release any allocated preview port.
+        try:
+            from app.port_manager import release_session
+            release_session(session_id)
+        except Exception:
+            pass
         return _session_summary(session)
 
     async def clear_output(self, session_id: str) -> dict:
