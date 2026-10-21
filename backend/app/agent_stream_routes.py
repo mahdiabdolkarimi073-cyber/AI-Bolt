@@ -30,7 +30,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.logging_config import log_backend, log_provider, log_error
+from app.logging_config import log_backend, log_provider, log_error, log_agent, log_tool, is_debug_enabled
 from app.db import connect
 from app.repositories import ConversationRepo, MessageRepo
 from app.connection_repos import ConnectionRepo, CredentialRepo, AgentDefaultsRepo
@@ -291,6 +291,20 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
             tool_instr_idx = len(messages)
             messages.append({"role": "system", "content": build_tool_instruction(project_root is not None)})
 
+            log_agent("Streaming agent loop starting",
+                      request_id=request_id,
+                      adapter=connection["adapter"],
+                      model=model,
+                      project_root=str(project_root) if project_root else "(none)",
+                      tools_count=len(tools_for_adapter),
+                      tool_names=[t.get("name", "?") for t in tools_for_adapter],
+                      max_rounds=MAX_TOOL_ROUNDS,
+                      timeout_s=timeout_s)
+            log_agent("Tools declared to model — run_command present",
+                      request_id=request_id,
+                      has_run_command=any(t.get("name") == "run_command" for t in tools_for_adapter),
+                      level=logging.DEBUG if is_debug_enabled() else logging.INFO)
+
             yield _sse("activity", {"status": "thinking", "message": "AI is analyzing your request"})
 
             tools_executed: list[dict] = []
@@ -304,6 +318,11 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
             req_t0 = time.time()
 
             for round_idx in range(MAX_TOOL_ROUNDS + 1):
+                log_agent("Stream round starting",
+                          request_id=request_id,
+                          round_idx=round_idx,
+                          message_count=len(current_messages),
+                          level=logging.DEBUG if is_debug_enabled() else logging.INFO)
                 try:
                     accumulated_text = ""
                     accumulated_tool_calls: list = []
@@ -328,6 +347,12 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                     req_dur = int((time.time() - req_t0) * 1000)
                     _log_request_failure(request_id, resolved_model=model, error_code=exc.category,
                                          error_msg=str(exc), status_code=exc.status_code, duration_ms=req_dur)
+                    log_agent("Stream adapter error — aborting",
+                              request_id=request_id,
+                              round_idx=round_idx,
+                              error_code=exc.category,
+                              error_msg=str(exc)[:200],
+                              level=logging.ERROR)
                     yield _sse("error", {"code": exc.category, "message": str(exc)})
                     return
                 except Exception as exc:
@@ -335,29 +360,61 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                     _log_request_failure(request_id, resolved_model=model, error_code="provider_failed",
                                          error_msg="The provider request failed unexpectedly.", status_code=None, duration_ms=req_dur)
                     log_error("Streaming provider exception", exc=exc, request_id=request_id)
+                    log_agent("Stream unexpected exception — aborting",
+                              request_id=request_id,
+                              round_idx=round_idx,
+                              error_type=type(exc).__name__,
+                              error_msg=str(exc)[:200],
+                              level=logging.ERROR)
                     yield _sse("error", {"code": "provider_failed", "message": "The provider request failed unexpectedly."})
                     return
 
                 full_text += accumulated_text
+                log_agent("Stream round completed — model response received",
+                          request_id=request_id,
+                          round_idx=round_idx,
+                          has_text=bool(accumulated_text),
+                          text_len=len(accumulated_text),
+                          tool_call_count=len(accumulated_tool_calls),
+                          finish_reason=round_finish or "(none)",
+                          level=logging.DEBUG if is_debug_enabled() else logging.INFO)
 
                 # If no tool calls, we're done. Tool execution is allowed
                 # even without a project root (create_project, get_env_template).
                 if not accumulated_tool_calls:
+                    log_agent("No tool calls in this round — ending loop",
+                              request_id=request_id,
+                              round_idx=round_idx)
                     break
 
                 # Execute tools and feed results back.
                 for tc in accumulated_tool_calls:
                     call_key = (tc.name, _json.dumps(tc.args, sort_keys=True))
                     if call_key in seen_tool_calls:
-                        log_backend("Agent tool call skipped (duplicate)",
-                                    request_id=request_id, tool=tc.name)
+                        log_agent("Tool call skipped (duplicate)",
+                                  request_id=request_id,
+                                  tool=tc.name,
+                                  level=logging.WARNING)
                         continue
                     seen_tool_calls.add(call_key)
+                    log_agent("Tool call received from model — dispatching",
+                              request_id=request_id,
+                              round_idx=round_idx,
+                              tool=tc.name,
+                              args_keys=list(tc.args.keys()) if isinstance(tc.args, dict) else [])
                     yield _sse("tool_start", {"name": tc.name, "args": tc.args})
                     yield _sse("activity", {"status": "tool", "message": _activity_for_tool(tc.name),
                                             "fileName": tc.args.get("path") if isinstance(tc.args, dict) else None})
                     tool_result = execute_tool_call(project_root, tc.name, tc.args)
                     tools_executed.append({"name": tc.name, "args": tc.args, "result": tool_result})
+                    log_agent("Tool execution result",
+                              request_id=request_id,
+                              round_idx=round_idx,
+                              tool=tc.name,
+                              success="error" not in tool_result,
+                              error=tool_result.get("error", "")[:200] if "error" in tool_result else "(none)",
+                              exit_code=tool_result.get("exitCode", "(n/a)"),
+                              level=logging.DEBUG if is_debug_enabled() else logging.INFO)
                     yield _sse("tool_result", {"name": tc.name, "result": tool_result})
 
                     fc = _detect_file_changes(tc.name, tc.args, tool_result)
@@ -383,8 +440,10 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                                         "role": "system",
                                         "content": (
                                             "A project has been created and is now the active project. "
+                                            "You now have full access to file tools (list_files, read_file, write_file, etc.), "
+                                            "run_command for terminal/shell commands, detect_runtime, and install_deps. "
                                             f"The project root is: {fc.get('workspacePath', '')}. "
-                                            "Continue with the next steps: list files, install dependencies, or write additional files as needed. "
+                                            "Continue with the next steps: list files to verify structure, install dependencies, run commands, or write additional files as needed. "
                                             "Do NOT stop after creating the project — complete all requested work."
                                         ),
                                     })
@@ -403,8 +462,20 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                     })
 
                 yield _sse("activity", {"status": "continuing", "message": "AI is continuing after tool execution"})
+                log_agent("Continuing to next round after tool execution",
+                          request_id=request_id,
+                          round_idx=round_idx,
+                          tools_executed_count=len(tools_executed),
+                          level=logging.DEBUG if is_debug_enabled() else logging.INFO)
 
             req_dur = int((time.time() - req_t0) * 1000)
+            log_agent("Streaming agent loop ended",
+                      request_id=request_id,
+                      total_rounds=round_idx + 1,
+                      total_tools_executed=len(tools_executed),
+                      full_text_len=len(full_text),
+                      finish_reason=finish_reason or "(none)",
+                      duration_ms=req_dur)
 
             # If we hit the round limit with tools still running, report it.
             round_limit_hit = accumulated_tool_calls and round_idx >= MAX_TOOL_ROUNDS

@@ -103,13 +103,20 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
       const requestId = `req-${Date.now().toString(36)}-${reqCounter.current}`;
       const startTime = performance.now();
 
-      logger.info('CHAT', 'User message submitted', {
+      logger.info('AGENT_DEBUG', 'Frontend — user message submitted', {
         requestId,
         conversationId: cid,
         provider: providerId,
         selectedModel: model || '(empty)',
         connectionId: connectionId ?? '(default)',
+        projectId: projectId ?? '(none)',
         messageLen: trimmed.length,
+        backendEnabled: config.backendEnabled,
+      });
+
+      logger.info('AGENT_DEBUG', 'Frontend — route selected', {
+        requestId,
+        route: config.backendEnabled ? 'backend-stream' : 'local-runtime',
       });
 
       setState((s) => ({
@@ -183,19 +190,21 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
               startedAt: Date.now(),
               finishedAt: Date.now(),
             };
-            logger.error('ERROR', 'Backend stream failed', {
+            logger.error('AGENT_DEBUG', 'Stream — backend error', {
               requestId,
               error_code: streamError.code,
+              error_message: streamError.message.slice(0, 200),
               durationMs,
             });
           } else if (streamResult) {
             result = streamResult;
-            logger.info('CHAT', 'Stream completed', {
+            logger.info('AGENT_DEBUG', 'Stream — completed', {
               requestId,
               status: result.status,
               durationMs,
               resolvedModel: result.meta?.model ?? '(none)',
               simulated: result.meta?.simulated ?? false,
+              toolsExecutedCount: result.toolsExecuted?.length ?? 0,
             });
           } else {
             // Stream was aborted (user clicked Stop) — no result, no error.

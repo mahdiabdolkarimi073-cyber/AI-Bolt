@@ -25,7 +25,7 @@ from fastapi import APIRouter, HTTPException, Header, status
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.logging_config import log_backend, log_provider, log_error, is_debug_enabled
+from app.logging_config import log_backend, log_provider, log_error, log_agent, log_tool, is_debug_enabled
 from app.db import connect
 from app.repositories import ConversationRepo, MessageRepo
 from app.connection_repos import ConnectionRepo, CredentialRepo, AgentDefaultsRepo
@@ -525,7 +525,24 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
         tools_for_adapter = GEMINI_TOOL_DECLARATIONS
         tool_instruction = build_tool_instruction(project_root is not None)
         messages.append({"role": "system", "content": tool_instruction})
+        tool_instr_idx = len(messages) - 1
 
+        log_agent("Non-streaming agent request — tools configured",
+                  request_id=request_id,
+                  adapter=connection["adapter"],
+                  model=model,
+                  project_root=str(project_root) if project_root else "(none)",
+                  tools_count=len(tools_for_adapter),
+                  tool_names=[t.get("name", "?") for t in tools_for_adapter],
+                  has_run_command=any(t.get("name") == "run_command" for t in tools_for_adapter),
+                  timeout_s=timeout_s)
+
+        log_agent("Non-streaming agent request — calling provider",
+                  request_id=request_id,
+                  model=model,
+                  messages_count=len(messages),
+                  tools_count=len(tools_for_adapter),
+                  timeout_s=timeout_s)
         try:
             result = _chat_with_retry(
                 adapter, connection["baseUrl"], secret, model, messages,
@@ -536,6 +553,13 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
             exc_msg = str(exc)
             exc_cat = exc.category
             exc_status = exc.status_code
+            log_agent("Non-streaming provider call failed (AdapterError)",
+                      request_id=request_id,
+                      error_code=exc_cat,
+                      error_msg=exc_msg[:200],
+                      status_code=exc_status,
+                      duration_ms=req_dur,
+                      level=40)  # ERROR
             _log_request_failure(
                 request_id, resolved_model=model,
                 error_code=exc_cat, error_msg=exc_msg,
@@ -609,6 +633,17 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
         provider_model = result.raw_meta.get("modelVersion") or result.raw_meta.get("model")
         provider_response_id = result.raw_meta.get("responseId")
         safe_usage = _safe_usage(result.usage)
+        log_agent("Non-streaming provider call succeeded",
+                  request_id=request_id,
+                  model=model,
+                  provider_model=provider_model or "(unreported)",
+                  has_content=bool(result.content),
+                  content_len=len(result.content or ""),
+                  tool_call_count=len(result.tool_calls),
+                  tool_call_names=[tc.name for tc in result.tool_calls] if result.tool_calls else [],
+                  finish_reason=result.finish_reason or "(none)",
+                  duration_ms=req_dur,
+                  level=20)  # INFO
         _log_request_success(
             request_id,
             resolved_model=model,
@@ -653,7 +688,18 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
 
         for _round in range(MAX_TOOL_ROUNDS):
             if not result.tool_calls:
+                log_agent("Non-streaming round — no tool calls, ending loop",
+                          request_id=request_id,
+                          round_idx=_round,
+                          level=logging.DEBUG if is_debug_enabled() else logging.INFO)
                 break
+            log_agent("Non-streaming round — model returned tool calls",
+                      request_id=request_id,
+                      round_idx=_round,
+                      tool_call_count=len(result.tool_calls),
+                      tool_names=[tc.name for tc in result.tool_calls],
+                      has_text=bool(result.content),
+                      text_len=len(result.content or ""))
             # If the model produced text alongside tool calls, preserve it.
             if result.content:
                 accumulated_text += result.content
@@ -661,39 +707,49 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                 call_key = (tc.name, _json.dumps(tc.args, sort_keys=True))
                 if call_key in seen_tool_calls:
                     # Skip duplicate tool call — already executed with same args.
-                    log_backend(
-                        "Agent tool call skipped (duplicate)",
-                        request_id=request_id,
-                        tool=tc.name,
-                    )
+                    log_agent("Tool call skipped (duplicate)",
+                              request_id=request_id,
+                              tool=tc.name,
+                              level=logging.WARNING)
                     continue
                 seen_tool_calls.add(call_key)
+                log_agent("Dispatching tool call",
+                          request_id=request_id,
+                          round_idx=_round,
+                          tool=tc.name,
+                          args_keys=list(tc.args.keys()) if isinstance(tc.args, dict) else [])
                 tool_result = execute_tool_call(project_root, tc.name, tc.args)
                 tools_executed.append({
                     "name": tc.name,
                     "args": tc.args,
                     "result": tool_result,
                 })
-                log_backend(
-                    "Agent tool executed",
-                    request_id=request_id,
-                    tool=tc.name,
-                    success="error" not in tool_result,
-                )
+                log_agent("Tool execution result",
+                          request_id=request_id,
+                          round_idx=_round,
+                          tool=tc.name,
+                          success="error" not in tool_result,
+                          error=tool_result.get("error", "")[:200] if "error" in tool_result else "(none)",
+                          exit_code=tool_result.get("exitCode", "(n/a)"),
+                          level=logging.DEBUG if is_debug_enabled() else logging.INFO)
                 # If create_project succeeded, update project_root so subsequent
                 # file tools work on the new project.
                 if tc.name == "create_project" and "error" not in tool_result and tool_result.get("projectId"):
                     new_root = resolve_project_root(tool_result["projectId"])
                     if new_root:
                         project_root = new_root
+                        current_messages[tool_instr_idx] = {
+                            "role": "system",
+                            "content": build_tool_instruction(True),
+                        }
                         current_messages.append({
                             "role": "system",
                             "content": (
                                 "A project has been created and is now the active project. "
                                 "You now have full access to file tools (list_files, read_file, write_file, etc.), "
-                                "run_command, detect_runtime, and install_deps. "
+                                "run_command for terminal/shell commands, detect_runtime, and install_deps. "
                                 f"The project root is: {tool_result.get('workspacePath', '')}. "
-                                "Continue with the next steps: list files, install dependencies, or write additional files as needed. "
+                                "Continue with the next steps: list files to verify structure, install dependencies, run commands, or write additional files as needed. "
                                 "Do NOT stop after creating the project — complete all requested work."
                             ),
                         })
@@ -756,6 +812,15 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
         final_content = result.content or ""
         if accumulated_text and not final_content:
             final_content = accumulated_text
+        log_agent("Non-streaming agent loop ended",
+                  request_id=request_id,
+                  total_rounds=_round + 1 if 'tool_calls' in dir(result) else 0,
+                  tools_executed_count=len(tools_executed),
+                  tools_summary=[{"name": t["name"], "success": "error" not in t["result"]} for t in tools_executed],
+                  final_content_len=len(final_content),
+                  finish_reason=result.finish_reason or "(none)",
+                  round_limit_hit=round_limit_hit,
+                  level=20)
         if not final_content and tools_executed:
             # The model only produced tool calls with no final summary — build one.
             summary_parts = [f"I executed {len(tools_executed)} tool operation(s):"]

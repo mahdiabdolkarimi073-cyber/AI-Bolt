@@ -17,8 +17,10 @@ Secret-laden files (.env, credentials) are excluded from broad searches.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
+import time as _time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -504,15 +506,26 @@ def _shell_argv(command: str) -> list[str]:
 def tool_run_command(project_root: Path, command: str, timeout_s: float = AGENT_CMD_TIMEOUT_S) -> dict:
     """Run a shell command synchronously in the project root. Returns stdout,
     stderr, and exit code. Output is secret-redacted and bounded."""
+    from app.logging_config import log_tool, is_debug_enabled
     if not command or not command.strip():
+        log_tool("run_command rejected — empty command", level=logging.WARNING)
         return {"error": "Command is required."}
     if len(command) > 4000:
+        log_tool("run_command rejected — command too long",
+                 length=len(command), level=logging.WARNING)
         return {"error": "Command is too long (max 4000 chars)."}
     argv = _shell_argv(command)
     env = os.environ.copy()
     env.setdefault("TERM", "dumb")
     env.setdefault("NO_COLOR", "1")
     env.setdefault("CI", "1")
+    log_tool("run_command starting subprocess",
+             command_preview=command[:120],
+             shell=argv[0],
+             cwd=str(project_root) if project_root else "(none)",
+             timeout_s=timeout_s,
+             platform=_sys.platform)
+    cmd_t0 = _time.time()
     try:
         proc = subprocess.run(
             argv,
@@ -524,14 +537,41 @@ def tool_run_command(project_root: Path, command: str, timeout_s: float = AGENT_
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
+        cmd_dur = int((_time.time() - cmd_t0) * 1000)
+        log_tool("run_command timed out",
+                 command_preview=command[:120],
+                 timeout_s=timeout_s,
+                 duration_ms=cmd_dur,
+                 level=logging.ERROR)
         return {"error": f"Command timed out after {int(timeout_s)}s.", "timeout": True, "command": command}
     except FileNotFoundError:
+        cmd_dur = int((_time.time() - cmd_t0) * 1000)
+        log_tool("run_command failed — shell not found",
+                 shell=argv[0],
+                 duration_ms=cmd_dur,
+                 level=logging.ERROR)
         return {"error": "Shell not found.", "command": command}
     except Exception as exc:
+        cmd_dur = int((_time.time() - cmd_t0) * 1000)
+        log_tool("run_command failed — exception",
+                 error_type=type(exc).__name__,
+                 error_msg=str(exc)[:200],
+                 duration_ms=cmd_dur,
+                 level=logging.ERROR)
         return {"error": f"Failed to execute command: {exc}", "command": command}
     from app.execution import redact_secrets as _redact
     stdout = _redact(proc.stdout or "")[:AGENT_CMD_MAX_OUTPUT]
     stderr = _redact(proc.stderr or "")[:AGENT_CMD_MAX_OUTPUT]
+    cmd_dur = int((_time.time() - cmd_t0) * 1000)
+    log_tool("run_command completed",
+             command_preview=command[:120],
+             exit_code=proc.returncode,
+             success=proc.returncode == 0,
+             duration_ms=cmd_dur,
+             stdout_len=len(stdout),
+             stderr_len=len(stderr),
+             stdout_preview=stdout[:200] if is_debug_enabled() else "(hidden)",
+             stderr_preview=stderr[:200] if is_debug_enabled() else "(hidden)")
     return {
         "command": command,
         "stdout": stdout,
@@ -1507,8 +1547,17 @@ def execute_tool_call(project_root: Optional[Path], name: str, args: dict) -> di
     All operations are scoped to project_root via safe_resolve_in_project.
     Returns a dict with either the tool result or an 'error' key.
     """
+    from app.logging_config import log_tool
+    log_tool("Tool dispatch invoked",
+             tool=name,
+             args_keys=list(args.keys()) if isinstance(args, dict) else [],
+             project_root=str(project_root) if project_root else "(none)",
+             project_exists=project_root.exists() if project_root else False)
     if not project_root or not project_root.exists():
         if name not in _TOOLS_NOT_REQUIRING_PROJECT_ROOT:
+            log_tool("Tool rejected — no project root",
+                     tool=name,
+                     level=logging.WARNING)
             return {"error": "No active project root available. Open a project or use create_project to scaffold a new one."}
         project_root = None  # explicitly None for create_project / get_env_template
     try:

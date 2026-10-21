@@ -20,13 +20,14 @@
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
-type Prefix = 'CHAT' | 'MODEL' | 'CONNECTION' | 'ERROR';
+type Prefix = 'CHAT' | 'MODEL' | 'CONNECTION' | 'ERROR' | 'AGENT_DEBUG';
 
 const PREFIX_TAG: Record<Prefix, string> = {
   CHAT: '[AI-IDE][CHAT]',
   MODEL: '[AI-IDE][MODEL]',
   CONNECTION: '[AI-IDE][CONNECTION]',
   ERROR: '[AI-IDE][ERROR]',
+  AGENT_DEBUG: '[AgentDebug][Frontend]',
 };
 
 function debugEnabled(): boolean {

@@ -25,6 +25,8 @@ from typing import Optional
 _PREFIX_BACKEND = "[AI-IDE][BACKEND]"
 _PREFIX_PROVIDER = "[AI-IDE][PROVIDER]"
 _PREFIX_ERROR = "[AI-IDE][ERROR]"
+_PREFIX_AGENT = "[AI-IDE][AGENT]"
+_PREFIX_TOOL = "[AI-IDE][TOOL]"
 
 _LOGGER_NAME = "app"
 
@@ -104,6 +106,16 @@ def log_backend(message: str, *, level: int = logging.INFO, **fields) -> None:
 def log_provider(message: str, *, level: int = logging.INFO, **fields) -> None:
     """Emit a [AI-IDE][PROVIDER] line with optional structured fields."""
     _logger().log(level, "%s %s%s", _PREFIX_PROVIDER, message, _format_fields(fields))
+
+
+def log_agent(message: str, *, level: int = logging.INFO, **fields) -> None:
+    """Emit a [AI-IDE][AGENT] line with optional structured fields."""
+    _logger().log(level, "%s %s%s", _PREFIX_AGENT, message, _format_fields(fields))
+
+
+def log_tool(message: str, *, level: int = logging.INFO, **fields) -> None:
+    """Emit a [AI-IDE][TOOL] line with optional structured fields."""
+    _logger().log(level, "%s %s%s", _PREFIX_TOOL, message, _format_fields(fields))
 
 
 def log_error(message: str, *, exc: Optional[BaseException] = None, **fields) -> None:

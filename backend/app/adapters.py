@@ -22,7 +22,7 @@ from typing import Any, Generator, Optional, Protocol
 import httpx
 
 from app.ssrf import validate_endpoint, safe_request_kwargs
-from app.logging_config import log_provider, log_error, is_debug_enabled
+from app.logging_config import log_provider, log_error, log_agent, is_debug_enabled
 
 
 # --- Result types ---
@@ -249,6 +249,12 @@ class OpenAICompatibleAdapter:
         content = (msg_obj or {}).get("content") if isinstance(msg_obj, dict) else None
         if not isinstance(content, str) or not content:
             raise AdapterError(CATEGORY_PROVIDER_ERROR, "Provider response had no content.")
+        log_agent("OpenAI-compatible chat — response parsed",
+                  model=model,
+                  has_content=bool(content),
+                  content_len=len(content) if content else 0,
+                  finish_reason=first.get("finish_reason") if isinstance(first, dict) else None,
+                  level=20)  # INFO
         return ChatResult(
             content=content,
             finish_reason=first.get("finish_reason") if isinstance(first, dict) else None,
@@ -493,6 +499,14 @@ class GeminiAdapter:
         tool_calls = self._extract_tool_calls(first.get("content"))
         finish = first.get("finishReason") if isinstance(first, dict) else None
         usage = body.get("usageMetadata") if isinstance(body.get("usageMetadata"), dict) else None
+        log_agent("Gemini chat — response parsed",
+                  model=model,
+                  has_content=bool(content),
+                  content_len=len(content) if content else 0,
+                  tool_call_count=len(tool_calls),
+                  tool_call_names=[tc.name for tc in tool_calls] if tool_calls else [],
+                  finish_reason=finish or "(none)",
+                  level=20)  # INFO
         # Preserve provider-reported metadata so the caller can verify which
         # model actually executed. modelVersion is Google's authoritative
         # actual-model field; responseId uniquely identifies the request.
@@ -608,6 +622,14 @@ class GeminiAdapter:
                                  tool_chunks=_tool_chunks,
                                  finish_reason=_finish_reason_seen or "(none)",
                                  sse_sent=_sse_sent)
+                log_agent("Gemini stream — diagnostics summary",
+                          model=model,
+                          lines_total=_lines_total,
+                          text_chunks=_text_chunks,
+                          tool_chunks=_tool_chunks,
+                          finish_reason=_finish_reason_seen or "(none)",
+                          sse_sent=_sse_sent,
+                          level=20)
                 # Fallback: if alt=sse was not honored and Gemini returned a JSON
                 # array, no SSE lines will have been parsed. Re-read the full body
                 # and parse it as a JSON array of chunks.

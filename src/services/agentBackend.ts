@@ -189,6 +189,18 @@ export async function streamAgentViaBackend(
     maxRetrievalChars: input.config.maxRetrievalChars ?? 3500,
   });
 
+  logger.info('AGENT_DEBUG', 'BackendRequest — stream starting', {
+    requestId: input.requestId ?? '(none)',
+    url,
+    method: 'POST',
+    conversationId: input.conversationId,
+    messageLen: input.message.length,
+    model: input.config.model || '(empty)',
+    providerId: input.config.providerId,
+    connectionId: input.config.connectionId ?? '(default)',
+    projectId: input.config.projectId ?? '(none)',
+  });
+
   let res: Response;
   try {
     res = await fetch(url, {
@@ -198,24 +210,44 @@ export async function streamAgentViaBackend(
       signal: input.signal,
     });
   } catch (err) {
-    if (input.signal?.aborted) return;
+    if (input.signal?.aborted) {
+      logger.warn('AGENT_DEBUG', 'Stream — fetch aborted by user', { requestId: input.requestId ?? '(none)' });
+      return;
+    }
+    logger.error('AGENT_DEBUG', 'Stream — fetch failed', { requestId: input.requestId ?? '(none)', msg: String(err).slice(0, 200) });
     callbacks.onError({ code: 'network', message: 'Could not connect to the backend.' });
     return;
   }
 
   if (!res.ok || !res.body) {
+    logger.error('AGENT_DEBUG', 'Stream — non-OK HTTP response', {
+      requestId: input.requestId ?? '(none)',
+      httpStatus: res.status,
+    });
     callbacks.onError({ code: 'server', message: `Backend returned HTTP ${res.status}.` });
     return;
   }
 
+  logger.info('AGENT_DEBUG', 'Stream — SSE connection established', {
+    requestId: input.requestId ?? '(none)',
+    httpStatus: res.status,
+  });
+
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let eventCount = 0;
 
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        logger.info('AGENT_DEBUG', 'Stream — reader done (EOF)', {
+          requestId: input.requestId ?? '(none)',
+          totalEvents: eventCount,
+        });
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
 
       // SSE events are separated by double newline.
@@ -223,6 +255,7 @@ export async function streamAgentViaBackend(
       while ((idx = buffer.indexOf('\n\n')) >= 0) {
         const rawEvent = buffer.slice(0, idx);
         buffer = buffer.slice(idx + 2);
+        eventCount++;
         parseSSEEvent(rawEvent, callbacks, input);
       }
     }
@@ -231,8 +264,15 @@ export async function streamAgentViaBackend(
       parseSSEEvent(buffer, callbacks, input);
     }
   } catch (err) {
-    if (input.signal?.aborted) return;
-    logger.error('CHAT', 'SSE stream read error', { requestId: input.requestId ?? '(none)', msg: String(err).slice(0, 200) });
+    if (input.signal?.aborted) {
+      logger.warn('AGENT_DEBUG', 'Stream — read aborted by user', { requestId: input.requestId ?? '(none)' });
+      return;
+    }
+    logger.error('AGENT_DEBUG', 'Stream — read error', {
+      requestId: input.requestId ?? '(none)',
+      msg: String(err).slice(0, 200),
+      eventsBeforeError: eventCount,
+    });
     callbacks.onError({ code: 'network', message: 'Connection interrupted during streaming.' });
   }
 }
@@ -245,32 +285,58 @@ function parseSSEEvent(raw: string, callbacks: StreamCallbacks, input: BackendAg
     if (line.startsWith('event: ')) event = line.slice(7).trim();
     else if (line.startsWith('data: ')) dataStr = line.slice(6);
   }
-  if (!event || !dataStr) return;
+  if (!event || !dataStr) {
+    logger.debug('AGENT_DEBUG', 'Stream — unknown SSE event (no event/data)', { requestId: input.requestId ?? '(none)', rawPreview: raw.slice(0, 80) });
+    return;
+  }
 
   let data: Record<string, unknown>;
   try {
     data = JSON.parse(dataStr);
   } catch {
+    logger.warn('AGENT_DEBUG', 'Stream — SSE data parse error', { requestId: input.requestId ?? '(none)', event });
     return;
   }
+
+  const rid = input.requestId ?? '(none)';
 
   switch (event) {
     case 'delta':
       callbacks.onDelta(data.text as string);
       break;
     case 'activity':
+      logger.debug('AGENT_DEBUG', 'Stream — activity event', { requestId: rid, status: data.status, message: data.message });
       callbacks.onActivity({ status: data.status as string, message: data.message as string, fileName: data.fileName as string | undefined });
       break;
     case 'file_change':
+      logger.info('AGENT_DEBUG', 'Stream — file_change event', { requestId: rid, path: data.path, action: data.action });
       callbacks.onFileChange({ path: data.path as string, action: data.action as FileChangeEvent['action'], oldPath: data.oldPath as string | undefined });
       break;
     case 'tool_start':
+      logger.info('AGENT_DEBUG', 'ToolCall — model invoked tool', {
+        requestId: rid,
+        tool: data.name,
+        argsKeys: data.args ? Object.keys(data.args as Record<string, unknown>) : [],
+      });
       callbacks.onToolStart({ name: data.name as string, args: data.args as Record<string, unknown> });
       break;
     case 'tool_result':
+      logger.info('AGENT_DEBUG', 'ToolResult — execution result received', {
+        requestId: rid,
+        tool: data.name,
+        success: !(data.result as Record<string, unknown>)?.error,
+        exitCode: (data.result as Record<string, unknown>)?.exitCode ?? '(n/a)',
+        error: ((data.result as Record<string, unknown>)?.error as string)?.slice(0, 150) ?? '(none)',
+      });
       callbacks.onToolResult({ name: data.name as string, result: data.result as Record<string, unknown> });
       break;
     case 'project_created':
+      logger.info('AGENT_DEBUG', 'Stream — project_created event', {
+        requestId: rid,
+        projectId: data.projectId,
+        workspacePath: data.workspacePath,
+        filesCount: ((data.files as string[]) ?? []).length,
+      });
       callbacks.onProjectCreated?.({
         projectId: data.projectId as string,
         workspacePath: data.workspacePath as string,
@@ -279,13 +345,27 @@ function parseSSEEvent(raw: string, callbacks: StreamCallbacks, input: BackendAg
       break;
     case 'done': {
       const payload = data as unknown as SSEDonePayload;
+      logger.info('AGENT_DEBUG', 'Stream — done event', {
+        requestId: rid,
+        toolsExecutedCount: payload.toolsExecuted?.length ?? 0,
+        model: payload.meta?.model ?? '(none)',
+        simulated: payload.meta?.simulated ?? false,
+        finishReason: payload.meta?.finishReason ?? '(none)',
+      });
       const result = donePayloadToAgentResult(payload, input);
       callbacks.onDone(result);
       break;
     }
     case 'error':
+      logger.error('AGENT_DEBUG', 'Stream — error event from backend', {
+        requestId: rid,
+        code: (data.code as string) ?? 'unknown',
+        message: ((data.message as string) ?? 'Unknown error.').slice(0, 200),
+      });
       callbacks.onError({ code: (data.code as string) ?? 'unknown', message: (data.message as string) ?? 'Unknown error.' });
       break;
+    default:
+      logger.warn('AGENT_DEBUG', 'Stream — unrecognized SSE event type', { requestId: rid, event });
   }
 }
 
