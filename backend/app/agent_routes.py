@@ -40,6 +40,7 @@ from app.agent_file_tools import (
     resolve_project_root,
     GEMINI_TOOL_DECLARATIONS,
     execute_tool_call,
+    build_tool_instruction,
 )
 
 
@@ -515,35 +516,15 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
         exc_cat = ""
         exc_status: Optional[int] = None
 
-        # Resolve the active project root for tool execution. Tools are only
-        # enabled when a project with an on-disk workspace is active.
+        # Resolve the active project root for tool execution. Tools are
+        # always sent to the model — when no project is open, only
+        # create_project and get_env_template will succeed.
         project_root = None
-        tools_for_adapter = None
         if body.projectId:
             project_root = resolve_project_root(body.projectId)
-            if project_root:
-                tools_for_adapter = GEMINI_TOOL_DECLARATIONS
-                tool_instruction = (
-                    "You have access to workspace tools to inspect and modify the active project. "
-                    "Use list_files to explore the project structure, read_file to inspect existing code, "
-                    "write_file to create or update files, create_directory for folders, search_files to find code, "
-                    "rename_path to rename, and delete_path to remove files. "
-                    "Follow these guidelines for efficient tool use:\n"
-                    "1. Use list_files once at the start to understand the project layout. Do not repeatedly list the same directory.\n"
-                    "2. Read a file before modifying it — you need to see existing content to make accurate edits.\n"
-                    "3. Do not read the same file multiple times in one request unless its content has changed.\n"
-                    "4. When the user asks you to create or modify files, use the write_file tool — do not just output code in your text response.\n"
-                    "5. After writing a file, you do not need to read it back to verify — the tool already verifies the write.\n"
-                    "6. When a tool returns an error, examine the error message and adjust your approach rather than repeating the same call.\n"
-                    "7. Report what you created or changed and the file path. All paths are relative to the project root."
-                )
-                messages.append({"role": "system", "content": tool_instruction})
-            else:
-                log_backend(
-                    "Project root not available for tools",
-                    request_id=request_id,
-                    project_id=body.projectId,
-                )
+        tools_for_adapter = GEMINI_TOOL_DECLARATIONS
+        tool_instruction = build_tool_instruction(project_root is not None)
+        messages.append({"role": "system", "content": tool_instruction})
 
         try:
             result = _chat_with_retry(
@@ -670,7 +651,7 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
         seen_tool_calls: set[tuple[str, str]] = set()
 
         for _round in range(MAX_TOOL_ROUNDS):
-            if not result.tool_calls or not project_root:
+            if not result.tool_calls:
                 break
             # If the model produced text alongside tool calls, preserve it.
             if result.content:

@@ -44,6 +44,7 @@ from app.agent_file_tools import (
     resolve_project_root,
     GEMINI_TOOL_DECLARATIONS,
     execute_tool_call,
+    build_tool_instruction,
 )
 from app.agent_routes import (
     AgentRunRequest,
@@ -180,6 +181,15 @@ def _detect_file_changes(tool_name: str, tool_args: dict, tool_result: dict) -> 
     if tool_name == "rename_path":
         return {"path": tool_result.get("toPath", ""), "action": "renamed",
                 "oldPath": tool_result.get("fromPath", "")}
+    if tool_name == "create_project":
+        files = tool_result.get("fileList", [])
+        if files:
+            return {"path": files[0], "action": "created",
+                    "projectCreated": True,
+                    "workspacePath": tool_result.get("workspacePath", ""),
+                    "projectId": tool_result.get("projectId", ""),
+                    "files": files}
+        return None
     return None
 
 
@@ -192,6 +202,11 @@ def _activity_for_tool(tool_name: str) -> str:
         "search_files": "Searching project",
         "rename_path": "Renaming file",
         "delete_path": "Deleting file",
+        "run_command": "Running command",
+        "detect_runtime": "Detecting runtime",
+        "install_deps": "Installing dependencies",
+        "create_project": "Creating project",
+        "get_env_template": "Reading env template",
     }
     return mapping.get(tool_name, "Executing tool")
 
@@ -255,26 +270,14 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
 
             timeout_s = float(settings.agent_timeout_seconds)
             project_root = None
-            tools_for_adapter = None
             if body.projectId:
                 project_root = resolve_project_root(body.projectId)
-                if project_root:
-                    tools_for_adapter = GEMINI_TOOL_DECLARATIONS
-                    tool_instruction = (
-                        "You have access to workspace tools to inspect and modify the active project. "
-                        "Use list_files to explore the project structure, read_file to inspect existing code, "
-                        "write_file to create or update files, create_directory for folders, search_files to find code, "
-                        "rename_path to rename, and delete_path to remove files. "
-                        "Follow these guidelines for efficient tool use:\n"
-                        "1. Use list_files once at the start to understand the project layout. Do not repeatedly list the same directory.\n"
-                        "2. Read a file before modifying it — you need to see existing content to make accurate edits.\n"
-                        "3. Do not read the same file multiple times in one request unless its content has changed.\n"
-                        "4. When the user asks you to create or modify files, use the write_file tool — do not just output code in your text response.\n"
-                        "5. After writing a file, you do not need to read it back to verify — the tool already verifies the write.\n"
-                        "6. When a tool returns an error, examine the error message and adjust your approach rather than repeating the same call.\n"
-                        "7. Report what you created or changed and the file path. All paths are relative to the project root."
-                    )
-                    messages.append({"role": "system", "content": tool_instruction})
+            # Always send tools to the model. When no project is open, only
+            # create_project and get_env_template will succeed; the others
+            # return a helpful error. This lets the agent scaffold new
+            # projects from an empty workspace.
+            tools_for_adapter = GEMINI_TOOL_DECLARATIONS
+            messages.append({"role": "system", "content": build_tool_instruction(project_root is not None)})
 
             yield _sse("activity", {"status": "thinking", "message": "AI is analyzing your request"})
 
@@ -325,8 +328,9 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
 
                 full_text += accumulated_text
 
-                # If no tool calls or no project root, we're done.
-                if not accumulated_tool_calls or not project_root:
+                # If no tool calls, we're done. Tool execution is allowed
+                # even without a project root (create_project, get_env_template).
+                if not accumulated_tool_calls:
                     break
 
                 # Execute tools and feed results back.
@@ -346,9 +350,18 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
 
                     fc = _detect_file_changes(tc.name, tc.args, tool_result)
                     if fc:
-                        yield _sse("file_change", fc)
-                        yield _sse("activity", {"status": "saved", "message": f"{'Created' if fc['action'] == 'created' else 'Saved'} {fc['path']}",
-                                                "fileName": fc["path"]})
+                        if fc.get("projectCreated"):
+                            yield _sse("project_created", {
+                                "projectId": fc.get("projectId", ""),
+                                "workspacePath": fc.get("workspacePath", ""),
+                                "files": fc.get("files", []),
+                            })
+                            yield _sse("activity", {"status": "saved", "message": f"Created project: {fc.get('workspacePath', '')}",
+                                                    "fileName": fc.get("workspacePath", "")})
+                        else:
+                            yield _sse("file_change", fc)
+                            yield _sse("activity", {"status": "saved", "message": f"{'Created' if fc['action'] == 'created' else 'Saved'} {fc['path']}",
+                                                    "fileName": fc["path"]})
 
                     current_messages.append({
                         "role": "assistant", "content": "",

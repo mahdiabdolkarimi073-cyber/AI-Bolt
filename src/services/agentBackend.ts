@@ -127,6 +127,7 @@ export interface StreamCallbacks {
   onFileChange: (event: FileChangeEvent) => void;
   onToolStart: (event: { name: string; args: Record<string, unknown> }) => void;
   onToolResult: (event: { name: string; result: Record<string, unknown> }) => void;
+  onProjectCreated?: (event: { projectId: string; workspacePath: string; files: string[] }) => void;
   onDone: (result: AgentResult) => void;
   onError: (error: { code: string; message: string }) => void;
 }
@@ -268,6 +269,13 @@ function parseSSEEvent(raw: string, callbacks: StreamCallbacks, input: BackendAg
       break;
     case 'tool_result':
       callbacks.onToolResult({ name: data.name as string, result: data.result as Record<string, unknown> });
+      break;
+    case 'project_created':
+      callbacks.onProjectCreated?.({
+        projectId: data.projectId as string,
+        workspacePath: data.workspacePath as string,
+        files: (data.files as string[]) ?? [],
+      });
       break;
     case 'done': {
       const payload = data as unknown as SSEDonePayload;

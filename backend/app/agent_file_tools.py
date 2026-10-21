@@ -1,14 +1,19 @@
-"""Agent file tools — read-only filesystem access scoped to the active project.
+"""Agent tools — filesystem access, command execution, runtime detection, and
+project scaffolding scoped to the active project.
 
-Phase 9 integrates project files into the Agent via the same context-injection
-pattern used for memory/knowledge retrieval. The Agent does NOT get autonomous
-filesystem access. Instead, when a user message references files or asks about
-the codebase, relevant file content is retrieved and injected as clearly
-labeled reference material — never as privileged instructions.
+The Agent receives a set of tools it can call during the tool-execution loop:
+  - File operations: list_files, read_file, write_file, create_directory,
+    search_files, rename_path, delete_path
+  - Command execution: run_command (synchronous, bounded, secret-redacted)
+  - Runtime detection: detect_runtime (inspects manifests + installed tools)
+  - Dependency installation: install_deps (runs the appropriate package manager)
+  - Project scaffolding: create_project (creates directory structure + files
+    for a requested technology stack)
+  - Environment config: get_env_template (returns required env vars for a stack)
 
-All operations go through `app.filesystem` for path validation and containment.
-Results are bounded and secret-laden files (.env, credentials) are excluded
-from broad searches.
+All file operations go through `app.filesystem` for path validation and
+containment. Command execution is synchronous and bounded by a timeout.
+Secret-laden files (.env, credentials) are excluded from broad searches.
 """
 from __future__ import annotations
 
@@ -470,7 +475,786 @@ def tool_delete_path(project_root: Path, rel_path: str) -> dict:
     return {"path": rel_path, "deleted": True}
 
 
+# --- Command execution tool (synchronous, bounded) ---
+
+import subprocess  # noqa: E402
+import sys as _sys  # noqa: E402
+
+AGENT_CMD_TIMEOUT_S = 60.0
+AGENT_CMD_MAX_OUTPUT = 50_000  # characters
+
+
+def _shell_argv(command: str) -> list[str]:
+    shell = _sys.platform == "win32" and "cmd.exe" or "/bin/sh"
+    if _sys.platform == "win32":
+        pwsh = None
+        for c in ("pwsh", "powershell"):
+            from app.execution import detect_tool as _dt
+            pwsh = _dt(c)
+            if pwsh:
+                shell = pwsh
+                return [shell, "-NoProfile", "-NonInteractive", "-Command", command]
+        return ["cmd.exe", "/C", command]
+    from app.execution import default_shell as _ds
+    shell = _ds()
+    return [shell, "-c", command]
+
+
+def tool_run_command(project_root: Path, command: str, timeout_s: float = AGENT_CMD_TIMEOUT_S) -> dict:
+    """Run a shell command synchronously in the project root. Returns stdout,
+    stderr, and exit code. Output is secret-redacted and bounded."""
+    if not command or not command.strip():
+        return {"error": "Command is required."}
+    if len(command) > 4000:
+        return {"error": "Command is too long (max 4000 chars)."}
+    argv = _shell_argv(command)
+    env = os.environ.copy()
+    env.setdefault("TERM", "dumb")
+    env.setdefault("NO_COLOR", "1")
+    env.setdefault("CI", "1")
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=min(timeout_s, AGENT_CMD_TIMEOUT_S),
+            env=env,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": f"Command timed out after {int(timeout_s)}s.", "timeout": True, "command": command}
+    except FileNotFoundError:
+        return {"error": "Shell not found.", "command": command}
+    except Exception as exc:
+        return {"error": f"Failed to execute command: {exc}", "command": command}
+    from app.execution import redact_secrets as _redact
+    stdout = _redact(proc.stdout or "")[:AGENT_CMD_MAX_OUTPUT]
+    stderr = _redact(proc.stderr or "")[:AGENT_CMD_MAX_OUTPUT]
+    return {
+        "command": command,
+        "stdout": stdout,
+        "stderr": stderr,
+        "exitCode": proc.returncode,
+        "success": proc.returncode == 0,
+    }
+
+
+# --- Runtime detection tool ---
+
+def tool_detect_runtime(project_root: Path) -> dict:
+    """Detect the project's runtime, framework, and available tools."""
+    from app.runtime_detect import detect_runtime as _detect, infer_commands as _infer
+    if not project_root or not project_root.exists():
+        return {"error": "No active project root available."}
+    rt = _detect(project_root)
+    cmds = _infer(project_root, rt)
+    return {
+        "runtime": rt.to_dict(),
+        "inferredCommands": [c.to_dict() for c in cmds],
+    }
+
+
+# --- Dependency installation tool ---
+
+def tool_install_deps(project_root: Path) -> dict:
+    """Detect the package manager and run the appropriate install command.
+    Does NOT run if the tool is missing — reports the limitation instead."""
+    from app.runtime_detect import detect_runtime as _detect
+    if not project_root or not project_root.exists():
+        return {"error": "No active project root available."}
+    rt = _detect(project_root)
+    pm = rt.package_manager
+    if not pm:
+        return {
+            "error": "No package manager detected for this project.",
+            "missingTools": rt.missing_tools,
+            "installHint": rt.install_hint,
+        }
+    # Check that the package manager tool is actually installed.
+    if not rt.available_tools.get(pm, False):
+        return {
+            "error": f"Package manager '{pm}' is not installed on this system.",
+            "installHint": rt.install_hint,
+        }
+    install_cmd = {
+        "npm": "npm install",
+        "pnpm": "pnpm install",
+        "yarn": "yarn install",
+        "bun": "bun install",
+        "pip": "pip install -r requirements.txt",
+        "poetry": "poetry install",
+        "uv": "uv sync",
+        "composer": "composer install",
+    }.get(pm, f"{pm} install")
+    result = tool_run_command(project_root, install_cmd, timeout_s=120.0)
+    result["packageManager"] = pm
+    result["installCommand"] = install_cmd
+    return result
+
+
+# --- Project scaffolding tool ---
+
+def _sanitize_project_name(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-._").lower()
+    return safe or "project"
+
+
+def tool_create_project(project_root: Path, project_name: str, tech_stack: str, description: str = "") -> dict:
+    """Create a new project directory structure inside the workspace root.
+    tech_stack selects the scaffold template: next, nest, vite-react, fastapi,
+    django, php, laravel, wordpress-plugin, express, node.
+    The project is created as a subdirectory of the workspace root (NOT inside
+    the current project root). Returns the relative workspace path."""
+    from app.config import workspace_root_path
+    from app.db import connect
+    from app.repositories import ProjectRepo
+    from app.filesystem import validate_relative_name
+
+    safe_name = _sanitize_project_name(project_name)
+    base = workspace_root_path()
+    candidate = safe_name
+    suffix = 1
+    while (base / candidate).exists():
+        suffix += 1
+        candidate = f"{safe_name}-{suffix}"
+    target = base / candidate
+    target.mkdir(parents=True, exist_ok=False)
+
+    scaffold = _SCAFFOLDS.get(tech_stack.lower().strip())
+    if not scaffold:
+        # Unknown stack — create empty dir and return. The model can then use
+        # write_file to populate it.
+        return {
+            "workspacePath": candidate,
+            "projectName": project_name,
+            "techStack": tech_stack,
+            "note": f"No built-in scaffold for '{tech_stack}'. Directory created empty. Use write_file to add project files.",
+        }
+
+    files = scaffold(project_name, description)
+    for rel_path, content in files:
+        fp = target / rel_path
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content, encoding="utf-8")
+
+    # Register the project in the DB so it appears in the Explorer.
+    with connect() as conn:
+        existing = ProjectRepo.get_by_workspace_path(conn, candidate)
+        if not existing:
+            project = ProjectRepo.create(
+                conn,
+                name=project_name,
+                path=candidate,
+                template=tech_stack,
+                workspace_path=candidate,
+                import_source="agent-scaffold",
+            )
+        else:
+            project = existing
+
+    return {
+        "workspacePath": candidate,
+        "projectName": project_name,
+        "techStack": tech_stack,
+        "projectId": project["id"],
+        "filesCreated": len(files),
+        "fileList": [fp for fp, _ in files],
+    }
+
+
+# --- Environment template tool ---
+
+def tool_get_env_template(project_root: Path, tech_stack: str) -> dict:
+    """Return the required environment variables for a given tech stack.
+    Does NOT create .env files or fill in secret values — the user must
+    provide those."""
+    template = _ENV_TEMPLATES.get(tech_stack.lower().strip())
+    if not template:
+        return {
+            "error": f"No env template for '{tech_stack}'.",
+            "available": list(_ENV_TEMPLATES.keys()),
+        }
+    return {"techStack": tech_stack, "variables": template}
+
+
+# --- Scaffold templates ---
+
+def _scaffold_next(name: str, desc: str) -> list[tuple[str, str]]:
+    pkg_name = _sanitize_project_name(name)
+    return [
+        ("package.json", _json_dumps({
+            "name": pkg_name,
+            "version": "0.1.0",
+            "private": True,
+            "scripts": {
+                "dev": "next dev",
+                "build": "next build",
+                "start": "next start",
+                "lint": "next lint",
+            },
+            "dependencies": {
+                "next": "^14.2.0",
+                "react": "^18.3.0",
+                "react-dom": "^18.3.0",
+            },
+            "devDependencies": {
+                "@types/node": "^20",
+                "@types/react": "^18",
+                "@types/react-dom": "^18",
+                "typescript": "^5",
+            },
+        })),
+        ("tsconfig.json", _json_dumps({
+            "compilerOptions": {
+                "target": "es5",
+                "lib": ["dom", "dom.iterable", "esnext"],
+                "allowJs": True,
+                "skipLibCheck": True,
+                "strict": True,
+                "forceConsistentCasingInFileNames": True,
+                "noEmit": True,
+                "esModuleInterop": True,
+                "module": "esnext",
+                "moduleResolution": "bundler",
+                "resolveJsonModule": True,
+                "isolatedModules": True,
+                "jsx": "preserve",
+                "incremental": True,
+                "paths": {"@/*": ["./src/*"]},
+            },
+            "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+            "exclude": ["node_modules"],
+        })),
+        ("next.config.mjs", "/** @type {import('next').NextConfig} */\nconst nextConfig = {};\nexport default nextConfig;\n"),
+        ("src/app/layout.tsx", "import type { Metadata } from 'next';\n\nexport const metadata: Metadata = {\n  title: '" + name + "',\n  description: '" + (desc or "Next.js app") + "',\n};\n\nexport default function RootLayout({\n  children,\n}: {\n  children: React.ReactNode;\n}) {\n  return (\n    <html lang=\"en\">\n      <body>{children}</body>\n    </html>\n  );\n}\n"),
+        ("src/app/page.tsx", "export default function Home() {\n  return (\n    <main>\n      <h1>" + name + "</h1>\n      <p>Welcome to your Next.js app.</p>\n    </main>\n  );\n}\n"),
+        ("src/app/globals.css", "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }\nbody { font-family: system-ui, sans-serif; }\n"),
+        (".env.example", "# Next.js environment variables\n# NEXT_PUBLIC_API_URL=http://localhost:8000\n"),
+        (".gitignore", "node_modules/\n.next/\n.env\n.env.local\n*.log\n"),
+    ]
+
+
+def _scaffold_nest(name: str, desc: str) -> list[tuple[str, str]]:
+    pkg_name = _sanitize_project_name(name)
+    return [
+        ("package.json", _json_dumps({
+            "name": pkg_name,
+            "version": "0.1.0",
+            "scripts": {
+                "build": "nest build",
+                "format": "prettier --write \"src/**/*.ts\"",
+                "start": "nest start",
+                "start:dev": "nest start --watch",
+                "start:prod": "node dist/main",
+                "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
+                "test": "jest",
+            },
+            "dependencies": {
+                "@nestjs/common": "^10.3.0",
+                "@nestjs/core": "^10.3.0",
+                "@nestjs/platform-express": "^10.3.0",
+                "reflect-metadata": "^0.2.0",
+                "rxjs": "^7.8.0",
+            },
+            "devDependencies": {
+                "@nestjs/cli": "^10.3.0",
+                "@types/node": "^20",
+                "typescript": "^5",
+                "ts-node": "^10",
+                "jest": "^29",
+            },
+        })),
+        ("tsconfig.json", _json_dumps({
+            "compilerOptions": {
+                "module": "commonjs",
+                "declaration": True,
+                "removeComments": True,
+                "emitDecoratorMetadata": True,
+                "experimentalDecorators": True,
+                "allowSyntheticDefaultImports": True,
+                "target": "es2021",
+                "sourceMap": True,
+                "outDir": "./dist",
+                "strict": True,
+                "noImplicitAny": False,
+                "strictNullChecks": False,
+                "esModuleInterop": True,
+            },
+            "exclude": ["node_modules", "test", "dist", "**/*spec.ts"],
+        })),
+        ("src/main.ts", "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  await app.listen(3000);\n}\nbootstrap();\n"),
+        ("src/app.module.ts", "import { Module } from '@nestjs/common';\n\n@Module({})\nexport class AppModule {}\n"),
+        ("src/app.controller.ts", "import { Controller, Get } from '@nestjs/common';\n\n@Controller()\nexport class AppController {\n  @Get()\n  getHello(): string {\n    return 'Hello from " + name + "!';\n  }\n}\n"),
+        (".env.example", "# NestJS environment variables\n# PORT=3000\n# DATABASE_URL=postgresql://user:pass@localhost:5432/db\n"),
+        (".gitignore", "node_modules/\ndist/\n.env\n*.log\n"),
+    ]
+
+
+def _scaffold_vite_react(name: str, desc: str) -> list[tuple[str, str]]:
+    pkg_name = _sanitize_project_name(name)
+    return [
+        ("package.json", _json_dumps({
+            "name": pkg_name,
+            "private": True,
+            "version": "0.0.0",
+            "type": "module",
+            "scripts": {
+                "dev": "vite",
+                "build": "tsc && vite build",
+                "preview": "vite preview",
+            },
+            "dependencies": {
+                "react": "^18.3.0",
+                "react-dom": "^18.3.0",
+            },
+            "devDependencies": {
+                "@types/react": "^18",
+                "@types/react-dom": "^18",
+                "@vitejs/plugin-react": "^4",
+                "typescript": "^5",
+                "vite": "^5",
+            },
+        })),
+        ("vite.config.ts", "import { defineConfig } from 'vite';\nimport react from '@vitejs/plugin-react';\n\nexport default defineConfig({\n  plugins: [react()],\n});\n"),
+        ("tsconfig.json", _json_dumps({
+            "compilerOptions": {
+                "target": "ES2020",
+                "useDefineForClassFields": True,
+                "lib": ["ES2020", "DOM", "DOM.Iterable"],
+                "module": "ESNext",
+                "skipLibCheck": True,
+                "moduleResolution": "bundler",
+                "jsx": "react-jsx",
+                "strict": True,
+            },
+            "include": ["src"],
+        })),
+        ("index.html", '<!DOCTYPE html>\n<html lang="en">\n  <head>\n    <meta charset="UTF-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n    <title>' + name + '</title>\n  </head>\n  <body>\n    <div id="root"></div>\n    <script type="module" src="/src/main.tsx"></script>\n  </body>\n</html>\n'),
+        ("src/main.tsx", "import React from 'react';\nimport ReactDOM from 'react-dom/client';\nimport App from './App';\n\nReactDOM.createRoot(document.getElementById('root')!).render(\n  <React.StrictMode>\n    <App />\n  </React.StrictMode>,\n);\n"),
+        ("src/App.tsx", "export default function App() {\n  return (\n    <div>\n      <h1>" + name + "</h1>\n      <p>" + (desc or "Vite + React app") + "</p>\n    </div>\n  );\n}\n"),
+        (".env.example", "# Vite environment variables (must be prefixed with VITE_)\n# VITE_API_URL=http://localhost:8000\n"),
+        (".gitignore", "node_modules/\ndist/\n.env\n.env.local\n*.log\n"),
+    ]
+
+
+def _scaffold_fastapi(name: str, desc: str) -> list[tuple[str, str]]:
+    pkg_name = _sanitize_project_name(name)
+    return [
+        ("requirements.txt", "fastapi>=0.110.0\nuvicorn[standard]>=0.27.0\npydantic>=2.0\n"),
+        ("main.py", "from fastapi import FastAPI\n\napp = FastAPI(title=\"" + name + "\")\n\n@app.get(\"/\")\ndef read_root():\n    return {\"message\": \"Hello from " + name + "\"}\n\n@app.get(\"/health\")\ndef health():\n    return {\"status\": \"ok\"}\n"),
+        ("app/__init__.py", ""),
+        ("app/config.py", "import os\n\nclass Settings:\n    DATABASE_URL: str = os.getenv(\"DATABASE_URL\", \"sqlite:///./app.db\")\n    SECRET_KEY: str = os.getenv(\"SECRET_KEY\", \"change-me-in-production\")\n\nsettings = Settings()\n"),
+        (".env.example", "# FastAPI environment variables\n# DATABASE_URL=sqlite:///./app.db\n# SECRET_KEY=change-me\n"),
+        (".gitignore", "__pycache__/\n*.pyc\n.env\nvenv/\n.venv/\n*.db\n"),
+        ("README.md", f"# {name}\n\n{desc or 'FastAPI project'}\n\n## Setup\n\n```bash\npip install -r requirements.txt\nuvicorn main:app --reload\n```\n"),
+    ]
+
+
+def _scaffold_django(name: str, desc: str) -> list[tuple[str, str]]:
+    pkg_name = _sanitize_project_name(name).replace("-", "_")
+    return [
+        ("requirements.txt", "Django>=5.0\ndjangorestframework>=3.15\npython-dotenv>=1.0\n"),
+        ("manage.py", "#!/usr/bin/env python\nimport os\nimport sys\n\ndef main():\n    os.environ.setdefault('DJANGO_SETTINGS_MODULE', '" + pkg_name + ".settings')\n    from django.core.management import execute_from_command_line\n    execute_from_command_line(sys.argv)\n\nif __name__ == '__main__':\n    main()\n"),
+        (f"{pkg_name}/__init__.py", ""),
+        (f"{pkg_name}/settings.py", f'"""Django settings for {name}."""\nimport os\nfrom pathlib import Path\n\nBASE_DIR = Path(__file__).resolve().parent.parent\n\nSECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "change-me-in-production")\nDEBUG = os.getenv("DJANGO_DEBUG", "True").lower() == "true"\nALLOWED_HOSTS = ["*"]\n\nINSTALLED_APPS = [\n    "django.contrib.contenttypes",\n    "django.contrib.auth",\n    "rest_framework",\n]\n\nMIDDLEWARE = []\nROOT_URLCONF = "{pkg_name}.urls"\nDATABASES = {{\n    "default": {{\n        "ENGINE": "django.db.backends.sqlite3",\n        "NAME": BASE_DIR / "db.sqlite3",\n    }}\n}}\nLANGUAGE_CODE = "en-us"\nTIME_ZONE = "UTC"\nUSE_TZ = True\n'),
+        (f"{pkg_name}/urls.py", f'from django.urls import path\n\nurlpatterns = [\n    path("", lambda r: None),\n]\n'),
+        (f"{pkg_name}/asgi.py", f'import os\nfrom django.core.asgi import get_asgi_application\n\nos.environ.setdefault("DJANGO_SETTINGS_MODULE", "{pkg_name}.settings")\napplication = get_asgi_application()\n'),
+        (f"{pkg_name}/wsgi.py", f'import os\nfrom django.core.wsgi import get_wsgi_application\n\nos.environ.setdefault("DJANGO_SETTINGS_MODULE", "{pkg_name}.settings")\napplication = get_wsgi_application()\n'),
+        (".env.example", "# Django environment variables\n# DJANGO_SECRET_KEY=change-me\n# DJANGO_DEBUG=True\n# DATABASE_URL=sqlite:///db.sqlite3\n"),
+        (".gitignore", "__pycache__/\n*.pyc\ndb.sqlite3\n.env\nvenv/\n.venv/\n"),
+    ]
+
+
+def _scaffold_php(name: str, desc: str) -> list[tuple[str, str]]:
+    safe = _sanitize_project_name(name)
+    return [
+        ("index.php", "<?php\n\n/**\n * " + name + " — PHP application\n * " + (desc or "") + "\n */\n\nheader('Content-Type: application/json');\n\necho json_encode([\n    'status' => 'ok',\n    'message' => 'Hello from " + name + "',\n]);\n"),
+        ("composer.json", _json_dumps({
+            "name": safe + "/" + safe,
+            "description": desc or "PHP application",
+            "type": "project",
+            "require": {"php": ">=8.1"},
+            "autoload": {"psr-4": {"App\\\\": "src/"}},
+        })),
+        ("src/.gitkeep", ""),
+        (".env.example", "# PHP environment variables\n# DB_HOST=localhost\n# DB_NAME=app\n# DB_USER=root\n# DB_PASS=\n"),
+        (".gitignore", "vendor/\n.env\n*.log\n"),
+    ]
+
+
+def _scaffold_laravel(name: str, desc: str) -> list[tuple[str, str]]:
+    safe = _sanitize_project_name(name)
+    return [
+        ("composer.json", _json_dumps({
+            "name": safe + "/" + safe,
+            "type": "project",
+            "description": desc or "Laravel application",
+            "require": {
+                "php": "^8.2",
+                "laravel/framework": "^11.0",
+            },
+            "require-dev": {
+                "fakerphp/faker": "^1.23",
+                "laravel/pint": "^1.13",
+                "phpunit/phpunit": "^11.0",
+            },
+            "autoload": {"psr-4": {"App\\\\": "app/", "Database\\\\": "database/"}},
+            "scripts": {
+                "post-autoload-dump": ["Illuminate\\\\Foundation\\\\ComposerScripts::postAutoloadDump", "@php artisan package:discover --ansi"],
+                "post-update-cmd": ["@php artisan vendor:publish --tag=laravel-assets --ansi --force"],
+            },
+        })),
+        ("artisan", "#!/usr/bin/env php\n<?php\n// Laravel artisan stub — run 'composer install' then 'php artisan serve'\n"),
+        ("public/index.php", "<?php\n// Laravel public entry point stub\nrequire __DIR__.'/../vendor/autoload.php';\n$app = require_once __DIR__.'/../bootstrap/app.php';\n"),
+        (".env.example", "APP_NAME=" + name + "\nAPP_ENV=local\nAPP_KEY=\nAPP_DEBUG=true\nAPP_URL=http://localhost\n\nDB_CONNECTION=mysql\nDB_HOST=127.0.0.1\nDB_PORT=3306\nDB_DATABASE=" + safe + "\nDB_USERNAME=root\nDB_PASSWORD=\n"),
+        (".gitignore", "/vendor\n/node_modules\n.env\nstorage/*.key\nstorage/app/*\nstorage/framework/*\nstorage/logs/*\n"),
+    ]
+
+
+def _scaffold_wordpress_plugin(name: str, desc: str) -> list[tuple[str, str]]:
+    safe = _sanitize_project_name(name)
+    class_name = "".join(w.capitalize() for w in safe.split("-")) + "_Plugin"
+    main_file = safe + ".php"
+    return [
+        (main_file, f"""<?php
+/**
+ * Plugin Name: {name}
+ * Description: {desc or 'A custom WordPress plugin'}
+ * Version: 1.0.0
+ * Author: Your Name
+ * License: GPL-2.0+
+ * Text Domain: {safe}
+ */
+
+if (!defined('ABSPATH')) {{
+    exit;
+}}
+
+class {class_name} {{
+
+    const VERSION = '1.0.0';
+
+    public function __construct() {{
+        add_action('init', [$this, 'init']);
+        add_action('admin_menu', [$this, 'add_admin_menu']);
+        add_action('admin_enqueue_scripts', [$this, 'enqueue_admin_assets']);
+        register_activation_hook(__FILE__, [$this, 'activate']);
+        register_deactivation_hook(__FILE__, [$this, 'deactivate']);
+    }}
+
+    public function init() {{
+        // Plugin initialization
+    }}
+
+    public function add_admin_menu() {{
+        add_options_page(
+            '{name}',
+            '{name}',
+            'manage_options',
+            '{safe}',
+            [$this, 'render_settings_page']
+        );
+    }}
+
+    public function render_settings_page() {{
+        if (!current_user_can('manage_options')) {{
+            return;
+        }}
+        ?>
+        <div class="wrap">
+            <h1><?php echo esc_html(get_admin_page_title()); ?></h1>
+            <form method="post" action="options.php">
+                <?php
+                settings_fields('{safe}_settings');
+                do_settings_sections('{safe}_settings');
+                submit_button();
+                ?>
+            </form>
+        </div>
+        <?php
+    }}
+
+    public function enqueue_admin_assets($hook) {{
+        if (strpos($hook, '{safe}') === false) {{
+            return;
+        }}
+        wp_enqueue_script(
+            '{safe}-admin',
+            plugin_dir_url(__FILE__) . 'assets/admin.js',
+            ['jquery'],
+            self::VERSION,
+            true
+        );
+        wp_enqueue_style(
+            '{safe}-admin',
+            plugin_dir_url(__FILE__) . 'assets/admin.css',
+            [],
+            self::VERSION
+        );
+        wp_localize_script('{safe}-admin', '{safe}Config', [
+            'ajaxUrl' => admin_url('admin-ajax.php'),
+            'nonce' => wp_create_nonce('{safe}_nonce'),
+        ]);
+    }}
+
+    public function activate() {{
+        flush_rewrite_rules();
+    }}
+
+    public function deactivate() {{
+        flush_rewrite_rules();
+    }}
+}}
+
+new {class_name}();
+"""),
+        ("assets/admin.js", f"""// {name} admin JavaScript
+jQuery(document).ready(function($) {{
+    // Admin scripts
+}});
+"""),
+        ("assets/admin.css", f"""/* {name} admin styles */
+.{_sanitize_project_name(name)}-settings {{
+    max-width: 800px;
+}}
+"""),
+        ("includes/class-admin-ajax.php", f"""<?php
+/**
+ * AJAX handlers for {name}
+ */
+
+if (!defined('ABSPATH')) {{
+    exit;
+}}
+
+class {class_name.replace('_Plugin', '_Ajax')} {{
+
+    public function __construct() {{
+        add_action('wp_ajax_{safe}_action', [$this, 'handle_ajax']);
+        add_action('wp_ajax_nopriv_{safe}_action', [$this, 'handle_ajax']);
+    }}
+
+    public function handle_ajax() {{
+        check_ajax_referer('{safe}_nonce', 'nonce');
+        if (!current_user_can('manage_options')) {{
+            wp_send_json_error('Insufficient permissions', 403);
+        }}
+        $input = sanitize_text_field($_POST['input'] ?? '');
+        wp_send_json_success(['result' => $input]);
+    }}
+}}
+"""),
+        ("uninstall.php", f"""<?php
+/**
+ * Uninstall {name}
+ */
+
+if (!defined('WP_UNINSTALL_PLUGIN')) {{
+    exit;
+}}
+
+// Clean up options
+delete_option('{safe}_settings');
+"""),
+        ("readme.txt", f"""=== {name} ===
+
+Contributors: yourname
+Tags: wordpress, plugin
+Requires at least: 6.0
+Tested up to: 6.5
+Stable tag: 1.0.0
+License: GPLv2 or later
+
+{desc or 'A custom WordPress plugin'}
+
+== Installation ==
+
+1. Upload the plugin folder to `/wp-content/plugins/`
+2. Activate the plugin in the Plugins menu in WordPress
+3. Configure settings under Settings → {name}
+"""),
+        (".gitignore", "node_modules/\n*.log\n"),
+    ]
+
+
+def _scaffold_express(name: str, desc: str) -> list[tuple[str, str]]:
+    pkg_name = _sanitize_project_name(name)
+    return [
+        ("package.json", _json_dumps({
+            "name": pkg_name,
+            "version": "1.0.0",
+            "type": "module",
+            "scripts": {
+                "start": "node server.js",
+                "dev": "node --watch server.js",
+            },
+            "dependencies": {
+                "express": "^4.19.0",
+            },
+        })),
+        ("server.js", "import express from 'express';\n\nconst app = express();\nconst PORT = process.env.PORT || 3000;\n\napp.use(express.json());\n\napp.get('/', (req, res) => {\n  res.json({ message: 'Hello from " + name + "' });\n});\n\napp.get('/health', (req, res) => {\n  res.json({ status: 'ok' });\n});\n\napp.listen(PORT, () => {\n  console.log(`Server running on port ${PORT}`);\n});\n"),
+        (".env.example", "# Express environment variables\n# PORT=3000\n# DATABASE_URL=\n"),
+        (".gitignore", "node_modules/\n.env\n*.log\n"),
+    ]
+
+
+def _scaffold_node(name: str, desc: str) -> list[tuple[str, str]]:
+    pkg_name = _sanitize_project_name(name)
+    return [
+        ("package.json", _json_dumps({
+            "name": pkg_name,
+            "version": "1.0.0",
+            "type": "module",
+            "scripts": {
+                "start": "node index.js",
+            },
+        })),
+        ("index.js", "console.log('Hello from " + name + "');\n"),
+        (".env.example", "# Node.js environment variables\n# API_KEY=\n"),
+        (".gitignore", "node_modules/\n.env\n*.log\n"),
+    ]
+
+
+def _json_dumps(obj) -> str:
+    import json
+    return json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
+
+
+_SCAFFOLDS = {
+    "next": _scaffold_next,
+    "nextjs": _scaffold_next,
+    "nest": _scaffold_nest,
+    "nestjs": _scaffold_nest,
+    "vite-react": _scaffold_vite_react,
+    "vite": _scaffold_vite_react,
+    "react": _scaffold_vite_react,
+    "fastapi": _scaffold_fastapi,
+    "django": _scaffold_django,
+    "php": _scaffold_php,
+    "laravel": _scaffold_laravel,
+    "wordpress-plugin": _scaffold_wordpress_plugin,
+    "wordpress": _scaffold_wordpress_plugin,
+    "wp-plugin": _scaffold_wordpress_plugin,
+    "express": _scaffold_express,
+    "node": _scaffold_node,
+    "nodejs": _scaffold_node,
+}
+
+
+_ENV_TEMPLATES: dict[str, list[dict]] = {
+    "next": [
+        {"name": "NEXT_PUBLIC_API_URL", "description": "Public API base URL", "required": False},
+        {"name": "DATABASE_URL", "description": "Database connection string", "required": False},
+        {"name": "NEXTAUTH_SECRET", "description": "NextAuth.js secret", "required": False},
+        {"name": "NEXTAUTH_URL", "description": "NextAuth.js base URL", "required": False},
+    ],
+    "nest": [
+        {"name": "PORT", "description": "Server port (default 3000)", "required": False},
+        {"name": "DATABASE_URL", "description": "Database connection string", "required": False},
+        {"name": "JWT_SECRET", "description": "JWT signing secret", "required": False},
+    ],
+    "vite-react": [
+        {"name": "VITE_API_URL", "description": "API base URL (must be prefixed with VITE_)", "required": False},
+    ],
+    "fastapi": [
+        {"name": "DATABASE_URL", "description": "Database connection string", "required": False},
+        {"name": "SECRET_KEY", "description": "App secret key for sessions/tokens", "required": True},
+        {"name": "ALLOWED_ORIGINS", "description": "CORS allowed origins", "required": False},
+    ],
+    "django": [
+        {"name": "DJANGO_SECRET_KEY", "description": "Django secret key", "required": True},
+        {"name": "DJANGO_DEBUG", "description": "Debug mode (True/False)", "required": False},
+        {"name": "DATABASE_URL", "description": "Database connection string", "required": False},
+    ],
+    "php": [
+        {"name": "DB_HOST", "description": "Database host", "required": False},
+        {"name": "DB_NAME", "description": "Database name", "required": False},
+        {"name": "DB_USER", "description": "Database user", "required": False},
+        {"name": "DB_PASS", "description": "Database password", "required": False},
+    ],
+    "laravel": [
+        {"name": "APP_NAME", "description": "Application name", "required": True},
+        {"name": "APP_KEY", "description": "Application key (run: php artisan key:generate)", "required": True},
+        {"name": "APP_ENV", "description": "Environment (local/production)", "required": False},
+        {"name": "DB_DATABASE", "description": "Database name", "required": False},
+        {"name": "DB_USERNAME", "description": "Database user", "required": False},
+        {"name": "DB_PASSWORD", "description": "Database password", "required": False},
+    ],
+    "wordpress-plugin": [
+        {"name": "WP_ENV", "description": "WordPress environment type", "required": False},
+        {"name": "WP_DEBUG", "description": "Enable WordPress debug mode", "required": False},
+    ],
+    "express": [
+        {"name": "PORT", "description": "Server port (default 3000)", "required": False},
+        {"name": "DATABASE_URL", "description": "Database connection string", "required": False},
+    ],
+    "node": [
+        {"name": "API_KEY", "description": "External API key if needed", "required": False},
+    ],
+}
+
+
 # --- Tool definitions for Gemini function calling ---
+
+TOOL_SYSTEM_INSTRUCTION = (
+    "You have access to workspace tools to inspect, modify, build, and scaffold projects.\n"
+    "\n"
+    "FILE TOOLS:\n"
+    "- list_files: List files/dirs at a path ('.' for root).\n"
+    "- read_file: Read a file's contents.\n"
+    "- write_file: Create or update a file (parents auto-created).\n"
+    "- create_directory: Create a directory.\n"
+    "- search_files: Search by filename or content.\n"
+    "- rename_path: Rename/move a file or directory.\n"
+    "- delete_path: Delete a file or directory (not the root).\n"
+    "\n"
+    "COMMAND & RUNTIME TOOLS:\n"
+    "- run_command: Run a finite shell command (build, test, lint, migrations). Returns stdout, stderr, exitCode. Max 60s timeout.\n"
+    "- detect_runtime: Detect the project's framework, language, package manager, and available/missing tools.\n"
+    "- install_deps: Install dependencies using the detected package manager (npm install, pip install, composer install, etc.).\n"
+    "- get_env_template: Get required env variables for a tech stack (next, nest, vite-react, fastapi, django, php, laravel, wordpress-plugin, express, node).\n"
+    "\n"
+    "PROJECT SCAFFOLDING:\n"
+    "- create_project: Create a new project with a standard scaffold. Available stacks: next, nest, vite-react, fastapi, django, php, laravel, wordpress-plugin, express, node.\n"
+    "  This creates the project under the workspace root, generates config files, and registers it.\n"
+    "\n"
+    "GUIDELINES:\n"
+    "1. Use detect_runtime first when you need to know the project's technology.\n"
+    "2. Use list_files once at the start. Do not repeatedly list the same directory.\n"
+    "3. Read a file before modifying it.\n"
+    "4. Use write_file to create/modify files — do not just output code in text.\n"
+    "5. After writing files, use install_deps if dependencies need installing.\n"
+    "6. Use run_command for build, test, lint, and migrations. Check exitCode to determine success.\n"
+    "7. When a tool returns an error, examine the error and adjust — do not repeat the same call.\n"
+    "8. For env variables, use get_env_template to learn what's needed. Do NOT fabricate secret values.\n"
+    "9. When the user asks for a new project, use create_project with the appropriate techStack.\n"
+    "10. Report what you created, changed, or ran, with file paths and exit codes. All paths are relative to the project root.\n"
+    "11. Do not run long-running dev servers via run_command. Tell the user to use the terminal panel for that.\n"
+    "12. For WordPress plugins, use create_project with techStack='wordpress-plugin'. This generates the main plugin file, settings page, AJAX handlers, assets, and uninstall.php with proper nonce checks, sanitization, and capability checks."
+)
+
+
+def build_tool_instruction(has_project: bool) -> str:
+    """Return the tool-use system instruction, adapted to whether a project is open."""
+    if has_project:
+        return TOOL_SYSTEM_INSTRUCTION
+    return (
+        "You have access to workspace tools, but NO PROJECT IS CURRENTLY OPEN.\n"
+        "File tools (list_files, read_file, write_file, etc.) and command tools (run_command, "
+        "detect_runtime, install_deps) require an active project — they will return an error.\n"
+        "However, you CAN use these tools right now:\n"
+        "- create_project: Create a new project with a standard scaffold. Available stacks: "
+        "next, nest, vite-react, fastapi, django, php, laravel, wordpress-plugin, express, node.\n"
+        "- get_env_template: Get required env variables for a tech stack.\n"
+        "\n"
+        "When the user asks to create, build, or scaffold a project, use create_project with the "
+        "appropriate techStack. After creating a project, report the workspacePath and fileList "
+        "from the tool result so the user knows what was created.\n"
+        "Do NOT claim you lack access to filesystem or project tools — you do have access via "
+        "the create_project tool. Use it."
+    )
+
 
 GEMINI_TOOL_DECLARATIONS: list[dict] = [
     {
@@ -556,17 +1340,74 @@ GEMINI_TOOL_DECLARATIONS: list[dict] = [
             "required": ["path"],
         },
     },
+    {
+        "name": "run_command",
+        "description": "Run a shell command in the project root. Returns stdout, stderr, and exit code. Output is bounded and secret-redacted. Use for build, test, lint, and finite commands. Do NOT use for long-running dev servers.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The shell command to execute."},
+                "timeout": {"type": "number", "description": "Timeout in seconds (default 60, max 60)."},
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "detect_runtime",
+        "description": "Detect the project's runtime, framework, package manager, and available/missing tools. Use this first when you need to know what technology the project uses.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "install_deps",
+        "description": "Install project dependencies using the detected package manager (npm, pip, composer, etc.). Fails honestly if the package manager is not installed.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "create_project",
+        "description": "Create a new project with a standard scaffold for the requested technology. Creates a directory under the workspace root, generates config files and boilerplate, and registers it in the project list. Available stacks: next, nest, vite-react, fastapi, django, php, laravel, wordpress-plugin, express, node.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "projectName": {"type": "string", "description": "Human-readable project name."},
+                "techStack": {"type": "string", "description": "Technology stack id: next, nest, vite-react, fastapi, django, php, laravel, wordpress-plugin, express, node."},
+                "description": {"type": "string", "description": "Optional project description."},
+            },
+            "required": ["projectName", "techStack"],
+        },
+    },
+    {
+        "name": "get_env_template",
+        "description": "Get the required environment variables for a technology stack. Returns variable names, descriptions, and whether they are required. Does NOT create .env files or fill in secret values.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "techStack": {"type": "string", "description": "Technology stack id (e.g. next, fastapi, laravel, wordpress-plugin)."},
+            },
+            "required": ["techStack"],
+        },
+    },
 ]
 
 
-def execute_tool_call(project_root: Path, name: str, args: dict) -> dict:
+_TOOLS_NOT_REQUIRING_PROJECT_ROOT = {"create_project", "get_env_template"}
+
+
+def execute_tool_call(project_root: Optional[Path], name: str, args: dict) -> dict:
     """Dispatch a tool call by name with validated arguments.
 
     All operations are scoped to project_root via safe_resolve_in_project.
     Returns a dict with either the tool result or an 'error' key.
     """
     if not project_root or not project_root.exists():
-        return {"error": "No active project root available."}
+        if name not in _TOOLS_NOT_REQUIRING_PROJECT_ROOT:
+            return {"error": "No active project root available. Open a project or use create_project to scaffold a new one."}
+        project_root = None  # explicitly None for create_project / get_env_template
     try:
         if name == "list_files":
             return tool_list_files(project_root, args.get("path", "."))
@@ -602,6 +1443,29 @@ def execute_tool_call(project_root: Path, name: str, args: dict) -> dict:
             if not isinstance(path, str):
                 return {"error": "Missing 'path' argument."}
             return tool_delete_path(project_root, path)
+        if name == "run_command":
+            command = args.get("command")
+            if not isinstance(command, str):
+                return {"error": "Missing 'command' argument."}
+            timeout = args.get("timeout", AGENT_CMD_TIMEOUT_S)
+            if not isinstance(timeout, (int, float)):
+                timeout = AGENT_CMD_TIMEOUT_S
+            return tool_run_command(project_root, command, float(timeout))
+        if name == "detect_runtime":
+            return tool_detect_runtime(project_root)
+        if name == "install_deps":
+            return tool_install_deps(project_root)
+        if name == "create_project":
+            project_name = args.get("projectName")
+            tech_stack = args.get("techStack")
+            if not isinstance(project_name, str) or not isinstance(tech_stack, str):
+                return {"error": "Missing 'projectName' or 'techStack' arguments."}
+            return tool_create_project(project_root, project_name, tech_stack, args.get("description", ""))
+        if name == "get_env_template":
+            tech_stack = args.get("techStack")
+            if not isinstance(tech_stack, str):
+                return {"error": "Missing 'techStack' argument."}
+            return tool_get_env_template(project_root, tech_stack)
         return {"error": f"Unknown tool: {name}"}
     except FilesystemError as exc:
         return {"error": str(exc.detail.get("message", "Filesystem error."))}

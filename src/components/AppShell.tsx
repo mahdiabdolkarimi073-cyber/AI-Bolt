@@ -160,6 +160,20 @@ export function AppShell() {
     [workspace],
   );
 
+  const handleAgentProjectCreated = useCallback(
+    async (event: { projectId: string; workspacePath: string; files: string[] }) => {
+      // Refresh the project list so the new project appears in the sidebar.
+      const list = await workspace.refreshProjects();
+      // Find the newly created project from the fresh list and open it.
+      const newProject = list.find((p) => p.id === event.projectId);
+      if (newProject) {
+        await workspace.openProject(newProject);
+        setSidebarSection('explorer');
+      }
+    },
+    [workspace],
+  );
+
   const agent = useAgentChat({
     conversationId,
     providerId: 'gemini' as const,
@@ -167,6 +181,7 @@ export function AppShell() {
     connectionId: activeConnectionId,
     projectId,
     onFileChange: handleAgentFileChange,
+    onProjectCreated: handleAgentProjectCreated,
   });
 
   const [simulatedIds, setSimulatedIds] = useState<Set<string>>(new Set());

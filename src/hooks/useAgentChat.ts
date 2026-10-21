@@ -19,6 +19,7 @@ export interface UseAgentChatOptions {
   /** Callback fired when the agent creates/modifies/deletes a file, so the
    *  UI can refresh the file tree and optionally open the file. */
   onFileChange?: (event: FileChangeEvent) => void;
+  onProjectCreated?: (event: { projectId: string; workspacePath: string; files: string[] }) => void;
 }
 
 export interface AgentChatState {
@@ -45,7 +46,7 @@ export interface UseAgentChatReturn extends AgentChatState {
 }
 
 export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
-  const { conversationId, providerId, model, connectionId = null, allowSimulation, projectId = null, onFileChange } = opts;
+  const { conversationId, providerId, model, connectionId = null, allowSimulation, projectId = null, onFileChange, onProjectCreated } = opts;
   const simulationAllowed = allowSimulation ?? !config.backendEnabled;
   const [state, setState] = useState<AgentChatState>({
     messages: [],
@@ -62,6 +63,8 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
   const reqCounter = useRef(0);
   const onFileChangeRef = useRef(onFileChange);
   onFileChangeRef.current = onFileChange;
+  const onProjectCreatedRef = useRef(onProjectCreated);
+  onProjectCreatedRef.current = onProjectCreated;
 
   const refresh = useCallback(async (override?: string) => {
     const cid = override ?? conversationId;
@@ -157,6 +160,9 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
                     : t,
                 ),
               }));
+            },
+            onProjectCreated: (event) => {
+              onProjectCreatedRef.current?.(event);
             },
             onDone: (res) => {
               streamResult = res;
