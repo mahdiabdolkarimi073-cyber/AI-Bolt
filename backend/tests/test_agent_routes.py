@@ -336,7 +336,7 @@ class TestRuntimeModelIdentityPrompt:
 
         captured_messages: list[dict] = []
 
-        def capture_chat(base_url, api_key, model, messages, *, timeout):
+        def capture_chat(base_url, api_key, model, messages, *, timeout, tools=None):
             captured_messages.extend(messages)
             return ChatResult(content="I am the model specified in my runtime metadata.",
                               finish_reason="STOP",
@@ -378,7 +378,7 @@ class TestRuntimeModelIdentityPrompt:
 
         captured_messages: list[dict] = []
 
-        def capture_chat(base_url, api_key, model, messages, *, timeout):
+        def capture_chat(base_url, api_key, model, messages, *, timeout, tools=None):
             captured_messages.extend(messages)
             return ChatResult(content="Response", finish_reason="STOP",
                               raw_meta={"provider": "gemini"})
@@ -420,7 +420,7 @@ class TestConfigurableTimeout:
 
         captured_timeout: list[float] = []
 
-        def capture_chat(base_url, api_key, model, messages, *, timeout):
+        def capture_chat(base_url, api_key, model, messages, *, timeout, tools=None):
             captured_timeout.append(timeout)
             return ChatResult(content="ok", finish_reason="STOP", raw_meta={"provider": "gemini"})
 
