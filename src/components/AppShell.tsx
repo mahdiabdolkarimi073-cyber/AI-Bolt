@@ -143,15 +143,30 @@ export function AppShell() {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const conversationIdRef = useCallback((id: string) => setConversationId(id), []);
 
+  const handleAgentFileChange = useCallback(
+    (event: { path: string; action: string; oldPath?: string }) => {
+      // Refresh the explorer tree so newly created/modified/deleted files appear.
+      void workspace.refreshTree();
+      // If a file was created or modified, auto-open it in the editor.
+      if ((event.action === 'created' || event.action === 'modified') && event.path) {
+        const node: FileNode = {
+          id: event.path,
+          name: event.path.split('/').pop() ?? event.path,
+          type: 'file',
+        };
+        void workspace.openFile(node);
+      }
+    },
+    [workspace],
+  );
+
   const agent = useAgentChat({
     conversationId,
     providerId: 'gemini' as const,
     model: activeModelId ?? '',
     connectionId: activeConnectionId,
-    // allowSimulation defaults to false in backend mode (so we never silently
-    // fake a Gemini response) and true in fallback mode (so the UI is usable
-    // without a backend).
     projectId,
+    onFileChange: handleAgentFileChange,
   });
 
   const [simulatedIds, setSimulatedIds] = useState<Set<string>>(new Set());
@@ -412,6 +427,10 @@ export function AppShell() {
                   error={agent.lastError}
                   onDismissError={agent.clearError}
                   lastMeta={agent.lastMeta}
+                  streamingText={agent.streamingText}
+                  isStreaming={agent.isStreaming}
+                  activity={agent.activity}
+                  toolEvents={agent.toolEvents}
                 />
               </div>
             ) : (

@@ -16,7 +16,8 @@ return structured results the caller can serialize safely.
 """
 from __future__ import annotations
 
-from typing import Any, Optional, Protocol
+import json as _json
+from typing import Any, Generator, Optional, Protocol
 
 import httpx
 
@@ -86,6 +87,16 @@ class ListModelsResult:
         self.raw_meta = raw_meta or {}
 
 
+class StreamChunk:
+    """A single chunk from a streaming chat response."""
+    def __init__(self, *, delta: str = "", tool_calls: Optional[list[ToolCall]] = None,
+                 finish_reason: Optional[str] = None, usage: Optional[dict] = None):
+        self.delta = delta
+        self.tool_calls = tool_calls or []
+        self.finish_reason = finish_reason
+        self.usage = usage
+
+
 class Adapter(Protocol):
     """Protocol every adapter implements."""
 
@@ -99,6 +110,11 @@ class Adapter(Protocol):
 
     def chat(self, base_url: str, api_key: str, model: str, messages: list[dict],
              *, timeout: float = 30.0, tools: Optional[list[dict]] = None) -> ChatResult:
+        ...
+
+    def chat_stream(self, base_url: str, api_key: str, model: str, messages: list[dict],
+                    *, timeout: float = 120.0, tools: Optional[list[dict]] = None
+                    ) -> Generator[StreamChunk, None, None]:
         ...
 
     def list_models(self, base_url: str, api_key: str, *, timeout: float = 20.0) -> ListModelsResult:
@@ -238,6 +254,79 @@ class OpenAICompatibleAdapter:
             usage=body.get("usage") if isinstance(body.get("usage"), dict) else None,
             raw_meta={"provider": "openai_compatible", "model": body.get("model")} if isinstance(body.get("model"), str) else {"provider": "openai_compatible"},
         )
+
+    def chat_stream(self, base_url: str, api_key: str, model: str, messages: list[dict],
+                    *, timeout: float = 120.0, tools: Optional[list[dict]] = None
+                    ) -> Generator[StreamChunk, None, None]:
+        url = self.validate_config(base_url)
+        if not api_key:
+            raise AdapterError(CATEGORY_AUTH_FAILED, "No API key available for this connection.")
+        body_payload: dict = {"model": model, "messages": messages, "temperature": 0.2, "stream": True}
+        if tools:
+            body_payload["tools"] = [{"type": "function", "function": t} for t in tools]
+        try:
+            with httpx.stream(
+                "POST",
+                self._chat_url(url),
+                headers=self._headers(api_key, _openrouter_headers(base_url)),
+                json=body_payload,
+                **safe_request_kwargs(timeout=timeout),
+            ) as r:
+                if r.status_code != 200:
+                    body = _safe_json(r)
+                    cat, msg = _classify_http_error(r.status_code, body)
+                    raise AdapterError(cat, msg, status_code=r.status_code)
+                for line in r.iter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        return
+                    try:
+                        chunk = _json.loads(data_str)
+                    except _json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    first = choices[0]
+                    if not isinstance(first, dict):
+                        continue
+                    delta_obj = first.get("delta")
+                    delta_text = ""
+                    tool_calls: list[ToolCall] = []
+                    if isinstance(delta_obj, dict):
+                        delta_text = delta_obj.get("content") or ""
+                        raw_tcs = delta_obj.get("tool_calls")
+                        if isinstance(raw_tcs, list):
+                            for tc in raw_tcs:
+                                if not isinstance(tc, dict):
+                                    continue
+                                fn = tc.get("function") or {}
+                                name = fn.get("name")
+                                if isinstance(name, str) and name:
+                                    args_raw = fn.get("arguments")
+                                    args: dict = {}
+                                    if isinstance(args_raw, str):
+                                        try:
+                                            args = _json.loads(args_raw)
+                                        except _json.JSONDecodeError:
+                                            args = {}
+                                    elif isinstance(args_raw, dict):
+                                        args = args_raw
+                                    tool_calls.append(ToolCall(name=name, args=args))
+                    finish = first.get("finish_reason")
+                    usage = chunk.get("usage") if isinstance(chunk.get("usage"), dict) else None
+                    if delta_text or tool_calls or finish:
+                        yield StreamChunk(delta=delta_text, tool_calls=tool_calls, finish_reason=finish, usage=usage)
+        except httpx.TimeoutException as exc:
+            raise AdapterError(CATEGORY_TIMEOUT, "The provider streaming request timed out.") from exc
+        except httpx.ConnectError as exc:
+            raise AdapterError(CATEGORY_NETWORK_ERROR, "Could not connect to the provider.") from exc
+        except httpx.HTTPError as exc:
+            if isinstance(exc, AdapterError):
+                raise
+            raise AdapterError(CATEGORY_NETWORK_ERROR, "Network error during streaming.") from exc
 
     def _headers(self, api_key: str, *, extra: Optional[dict] = None) -> dict:
         h = {
@@ -418,6 +507,73 @@ class GeminiAdapter:
             raw_meta=raw_meta,
             tool_calls=tool_calls,
         )
+
+    def chat_stream(self, base_url: str, api_key: str, model: str, messages: list[dict],
+                    *, timeout: float = 120.0, tools: Optional[list[dict]] = None
+                    ) -> Generator[StreamChunk, None, None]:
+        url = self.validate_config(base_url)
+        if not api_key:
+            raise AdapterError(CATEGORY_AUTH_FAILED, "No API key available for this connection.")
+        contents = self._to_gemini_contents(messages)
+        system_instruction = self._extract_system(messages)
+        payload: dict = {
+            "contents": contents,
+            "generationConfig": {"temperature": 0.2},
+        }
+        if system_instruction:
+            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+        if tools:
+            payload["tools"] = [{"functionDeclarations": tools}]
+        try:
+            with httpx.stream(
+                "POST",
+                self._model_url(url, model, stream=True).replace("API_KEY_PLACEHOLDER", _q(api_key)),
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                **safe_request_kwargs(timeout=timeout),
+            ) as r:
+                if r.status_code != 200:
+                    body = _safe_json(r)
+                    cat, msg = _classify_http_error(r.status_code, body)
+                    raise AdapterError(cat, msg, status_code=r.status_code)
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    data_str = line
+                    if data_str.startswith("data: "):
+                        data_str = data_str[6:]
+                    data_str = data_str.strip()
+                    if not data_str or data_str == "[DONE]":
+                        continue
+                    try:
+                        parsed = _json.loads(data_str)
+                    except _json.JSONDecodeError:
+                        continue
+                    chunks = parsed if isinstance(parsed, list) else [parsed]
+                    for chunk in chunks:
+                        if not isinstance(chunk, dict):
+                            continue
+                        candidates = chunk.get("candidates") or []
+                        if not candidates:
+                            continue
+                        first = candidates[0]
+                        if not isinstance(first, dict):
+                            continue
+                        content = first.get("content")
+                        delta_text = self._extract_text(content)
+                        tool_calls = self._extract_tool_calls(content)
+                        finish = first.get("finishReason")
+                        usage = chunk.get("usageMetadata") if isinstance(chunk.get("usageMetadata"), dict) else None
+                        if delta_text or tool_calls or finish:
+                            yield StreamChunk(delta=delta_text, tool_calls=tool_calls, finish_reason=finish, usage=usage)
+        except httpx.TimeoutException as exc:
+            raise AdapterError(CATEGORY_TIMEOUT, "The Gemini streaming request timed out.") from exc
+        except httpx.ConnectError as exc:
+            raise AdapterError(CATEGORY_NETWORK_ERROR, "Could not connect to the Gemini endpoint.") from exc
+        except httpx.HTTPError as exc:
+            if isinstance(exc, AdapterError):
+                raise
+            raise AdapterError(CATEGORY_NETWORK_ERROR, "Network error during Gemini streaming.") from exc
 
     def list_models(self, base_url: str, api_key: str, *, timeout: float = 20.0) -> ListModelsResult:
         url = self.validate_config(base_url)

@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { PanelRightClose, Sparkles, MoreHorizontal, Trash2, AlertCircle, X, Activity } from 'lucide-react';
+import { PanelRightClose, Sparkles, MoreHorizontal, Trash2, AlertCircle, X, Activity, Loader2, FilePen, FilePlus, FileX, FolderPlus, Search, Check } from 'lucide-react';
 import { ChatMessage } from './ChatMessage';
 import { ChatComposer } from './ChatComposer';
 import type { ChatMessage as ChatMessageType } from '@/types';
 import type { ProviderExecutionMeta } from '@/types/agent';
+import type { ActivityEvent } from '@/services/agentBackend';
 
 interface Props {
   messages: ChatMessageType[];
@@ -11,19 +12,18 @@ interface Props {
   busy: boolean;
   onStop: () => void;
   onCollapse: () => void;
-  /** Display label for the active connection, shown in the chat header. */
   connectionLabel: string;
-  /** Active model id, shown in the chat header. */
   modelLabel: string;
-  /** Whether the active connection has been tested successfully. */
   connected: boolean;
-  /** Map of message id -> simulated flag (assistant messages from the dev provider). */
   simulatedIds?: Set<string>;
-  /** Last error message to surface, if any. */
   error?: string | null;
   onDismissError?: () => void;
-  /** Metadata from the most recent provider request, for diagnostics. */
   lastMeta?: ProviderExecutionMeta;
+  /** Text actively being streamed for the in-progress assistant message. */
+  streamingText?: string;
+  isStreaming?: boolean;
+  activity?: ActivityEvent[];
+  toolEvents?: Array<{ name: string; args: Record<string, unknown>; result?: Record<string, unknown> }>;
 }
 
 function DiagnosticBar({ meta }: { meta: ProviderExecutionMeta }) {
@@ -99,7 +99,106 @@ function DiagnosticBar({ meta }: { meta: ProviderExecutionMeta }) {
   );
 }
 
-export function AIChatPanel({ messages, onSend, busy, onStop, onCollapse, connectionLabel, modelLabel, connected, simulatedIds, error, onDismissError, lastMeta }: Props) {
+function ActivityIcon({ status }: { status: string }) {
+  switch (status) {
+    case 'thinking':
+      return <Loader2 size={11} className="shrink-0 animate-spin text-accent-400" />;
+    case 'tool':
+      return <FilePen size={11} className="shrink-0 text-accent-400" />;
+    case 'saved':
+      return <Check size={11} className="shrink-0 text-success-500" />;
+    case 'completed':
+      return <Check size={11} className="shrink-0 text-success-500" />;
+    case 'simulating':
+      return <Loader2 size={11} className="shrink-0 animate-spin text-warning-400" />;
+    default:
+      return <Activity size={11} className="shrink-0 text-surface-400" />;
+  }
+}
+
+function ToolIcon({ name }: { name: string }) {
+  if (name === 'write_file') return <FilePen size={10} className="shrink-0 text-accent-400" />;
+  if (name === 'list_files') return <Search size={10} className="shrink-0 text-surface-400" />;
+  if (name === 'read_file') return <FilePen size={10} className="shrink-0 text-surface-300" />;
+  if (name === 'create_directory') return <FolderPlus size={10} className="shrink-0 text-accent-400" />;
+  if (name === 'delete_path') return <FileX size={10} className="shrink-0 text-error-400" />;
+  if (name === 'search_files') return <Search size={10} className="shrink-0 text-surface-400" />;
+  return <Activity size={10} className="shrink-0 text-surface-400" />;
+}
+
+function ActivityPanel({ activity, toolEvents, isStreaming }: {
+  activity: ActivityEvent[];
+  toolEvents: Array<{ name: string; args: Record<string, unknown>; result?: Record<string, unknown> }>;
+  isStreaming: boolean;
+}) {
+  if (activity.length === 0 && toolEvents.length === 0 && !isStreaming) return null;
+
+  return (
+    <div className="border-b border-surface-700 bg-surface-900/40 px-3 py-2 space-y-1.5 max-h-40 overflow-y-auto scrollbar-thin">
+      {toolEvents.map((tool, i) => (
+        <div key={`tool-${i}`} className="flex items-center gap-2 text-2xs text-surface-300 animate-fade-in">
+          <ToolIcon name={tool.name} />
+          <span className="font-mono">{tool.name}</span>
+          {tool.args && typeof tool.args.path === 'string' && (
+            <span className="truncate text-surface-400">{tool.args.path}</span>
+          )}
+          {tool.result && (
+            <span className={('error' in tool.result) ? 'text-error-400' : 'text-success-500'}>
+              {'error' in tool.result ? 'failed' : 'ok'}
+            </span>
+          )}
+          {!tool.result && <Loader2 size={10} className="shrink-0 animate-spin text-accent-400" />}
+        </div>
+      ))}
+      {activity.filter(a => a.status !== 'thinking' || activity.indexOf(a) === activity.length - 1).slice(-3).map((evt, i) => (
+        <div key={`act-${i}`} className="flex items-center gap-2 text-2xs text-surface-300 animate-fade-in">
+          <ActivityIcon status={evt.status} />
+          <span className="truncate">{evt.message}</span>
+          {evt.fileName && <span className="truncate text-surface-400 font-mono">{evt.fileName}</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function StreamingMessage({ text }: { text: string }) {
+  return (
+    <div className="flex gap-3 px-3 py-3 animate-fade-in">
+      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-gradient-to-br from-accent-500 to-accent-700 text-white">
+        <Sparkles size={14} className="animate-pulse" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="text-2xs font-semibold text-gray-200">Assistant</span>
+          <Loader2 size={10} className="animate-spin text-accent-400" />
+        </div>
+        <p className="mt-1 whitespace-pre-wrap text-xs leading-relaxed text-surface-300">
+          {text}
+          <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-accent-400 align-middle" />
+        </p>
+      </div>
+    </div>
+  );
+}
+
+export function AIChatPanel({
+  messages,
+  onSend,
+  busy,
+  onStop,
+  onCollapse,
+  connectionLabel,
+  modelLabel,
+  connected,
+  simulatedIds,
+  error,
+  onDismissError,
+  lastMeta,
+  streamingText,
+  isStreaming,
+  activity,
+  toolEvents,
+}: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -107,7 +206,9 @@ export function AIChatPanel({ messages, onSend, busy, onStop, onCollapse, connec
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages]);
+  }, [messages, streamingText, activity, toolEvents]);
+
+  const showStreaming = isStreaming && streamingText !== '';
 
   return (
     <div className="flex h-full min-w-0 flex-col border-l border-surface-700 bg-surface-850">
@@ -157,12 +258,21 @@ export function AIChatPanel({ messages, onSend, busy, onStop, onCollapse, connec
 
       {lastMeta && !lastMeta.simulated && <DiagnosticBar meta={lastMeta} />}
 
+      {(activity?.length ?? 0) > 0 || (toolEvents?.length ?? 0) > 0 || isStreaming ? (
+        <ActivityPanel
+          activity={activity ?? []}
+          toolEvents={toolEvents ?? []}
+          isStreaming={isStreaming ?? false}
+        />
+      ) : null}
+
       {/* messages */}
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
         <div className="divide-y divide-surface-800">
           {messages.map((m) => (
             <ChatMessage key={m.id} message={m} simulated={simulatedIds?.has(m.id)} />
           ))}
+          {showStreaming && <StreamingMessage text={streamingText} />}
         </div>
       </div>
 

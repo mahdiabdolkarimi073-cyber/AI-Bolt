@@ -4,37 +4,21 @@ import type { ProviderId } from '@/types';
 import type { AgentResult, AgentMessage } from '@/types/agent';
 import { getAgentRuntime } from '@/services/agentService';
 import { getRepositories } from '@/services/index';
-import { runAgentViaBackend } from '@/services/agentBackend';
+import { runAgentViaBackend, streamAgentViaBackend, type ActivityEvent, type FileChangeEvent } from '@/services/agentBackend';
 import { apiErrorToAgentError } from '@/types/agent';
 import type { ProviderExecutionMeta } from '@/types/agent';
 import { logger } from '@/lib/logger';
-
-/**
- * React hook that bridges the Agent runtime to the chat UI.
- *
- * - In backend mode, delegates to POST /agent/run (single authoritative
- *   persistence path on the server).
- * - In fallback mode, runs the local AgentRuntime (DevProvider simulation,
- *   since no real provider keys exist in the browser).
- *
- * The hook is the ONLY place that submits messages and refreshes the message
- * list, preventing the UI from independently persisting duplicates.
- */
 
 export interface UseAgentChatOptions {
   conversationId: string | null;
   providerId: ProviderId;
   model: string;
-  /** Phase 6: configured connection id. When set, the backend routes through
-   *  that connection's adapter + credentials. When null in backend mode, the
-   *  backend uses its configured agent default. */
   connectionId?: string | null;
-  /** Allow the deterministic dev provider to answer when no real provider is ready.
-   *  Defaults to false in backend mode (never silently simulate) and true in
-   *  browser fallback mode (so the UI is still exercisable without a backend). */
   allowSimulation?: boolean;
-  /** Phase 7: active project id for memory/knowledge retrieval scoping. */
   projectId?: string | null;
+  /** Callback fired when the agent creates/modifies/deletes a file, so the
+   *  UI can refresh the file tree and optionally open the file. */
+  onFileChange?: (event: FileChangeEvent) => void;
 }
 
 export interface AgentChatState {
@@ -42,34 +26,42 @@ export interface AgentChatState {
   busy: boolean;
   lastError: string | null;
   lastSimulated: boolean;
+  /** Text that is currently being streamed in (progressive display). */
+  streamingText: string;
+  /** Whether a stream is actively producing text. */
+  isStreaming: boolean;
+  /** Activity events from the current/last run. */
+  activity: ActivityEvent[];
+  /** Tool executions from the current/last run. */
+  toolEvents: Array<{ name: string; args: Record<string, unknown>; result?: Record<string, unknown> }>;
 }
 
 export interface UseAgentChatReturn extends AgentChatState {
-  /** Send a message. An optional override lets the caller supply a freshly
-   *  created conversation id before the hook has re-rendered with it. */
   send: (text: string, conversationIdOverride?: string) => Promise<AgentResult | null>;
   stop: () => void;
   refresh: (conversationIdOverride?: string) => Promise<void>;
   clearError: () => void;
-  /** Metadata from the most recent completed provider request, for diagnostics. */
-  lastMeta?: import('@/types/agent').ProviderExecutionMeta;
+  lastMeta?: ProviderExecutionMeta;
 }
 
 export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
-  const { conversationId, providerId, model, connectionId = null, allowSimulation, projectId = null } = opts;
-  // In backend mode, default simulation OFF — never silently return a simulated
-  // response when a real connection is expected. In fallback mode, allow it so
-  // the UI remains demonstrable without a backend.
+  const { conversationId, providerId, model, connectionId = null, allowSimulation, projectId = null, onFileChange } = opts;
   const simulationAllowed = allowSimulation ?? !config.backendEnabled;
   const [state, setState] = useState<AgentChatState>({
     messages: [],
     busy: false,
     lastError: null,
     lastSimulated: false,
+    streamingText: '',
+    isStreaming: false,
+    activity: [],
+    toolEvents: [],
   });
   const [lastMeta, setLastMeta] = useState<ProviderExecutionMeta | undefined>(undefined);
   const controllerRef = useRef<AbortController | null>(null);
   const reqCounter = useRef(0);
+  const onFileChangeRef = useRef(onFileChange);
+  onFileChangeRef.current = onFileChange;
 
   const refresh = useCallback(async (override?: string) => {
     const cid = override ?? conversationId;
@@ -100,7 +92,7 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
       if (!cid) return null;
       const trimmed = text.trim();
       if (!trimmed) return null;
-      if (controllerRef.current) return null; // prevent overlapping submissions
+      if (controllerRef.current) return null;
 
       const controller = new AbortController();
       controllerRef.current = controller;
@@ -117,52 +109,97 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
         messageLen: trimmed.length,
       });
 
-      setState((s) => ({ ...s, busy: true, lastError: null }));
+      setState((s) => ({
+        ...s,
+        busy: true,
+        lastError: null,
+        streamingText: '',
+        isStreaming: false,
+        activity: [],
+        toolEvents: [],
+      }));
 
       try {
         let result: AgentResult;
+
         if (config.backendEnabled) {
-          logger.debug('CHAT', 'Sending request to backend', {
-            requestId,
-            endpoint: '/agent/run',
-            provider: providerId,
-            selectedModel: model || '(empty)',
-          });
-          const { data, error } = await runAgentViaBackend({
+          // Streaming mode: use SSE endpoint for progressive display.
+          const streamInput = {
             conversationId: cid,
             message: trimmed,
             config: { providerId, model, connectionId: connectionId ?? undefined, allowSimulation: simulationAllowed, projectId },
             signal: controller.signal,
             requestId,
+          };
+
+          let streamResult: AgentResult | null = null;
+          let streamError: { code: string; message: string } | null = null;
+
+          await streamAgentViaBackend(streamInput, {
+            onDelta: (deltaText) => {
+              setState((s) => ({ ...s, streamingText: s.streamingText + deltaText, isStreaming: true }));
+            },
+            onActivity: (event) => {
+              setState((s) => ({ ...s, activity: [...s.activity, event] }));
+            },
+            onFileChange: (event) => {
+              onFileChangeRef.current?.(event);
+            },
+            onToolStart: (event) => {
+              setState((s) => ({ ...s, toolEvents: [...s.toolEvents, { name: event.name, args: event.args }] }));
+            },
+            onToolResult: (event) => {
+              setState((s) => ({
+                ...s,
+                toolEvents: s.toolEvents.map((t, i) =>
+                  i === s.toolEvents.length - 1 && t.name === event.name && !t.result
+                    ? { ...t, result: event.result }
+                    : t,
+                ),
+              }));
+            },
+            onDone: (res) => {
+              streamResult = res;
+            },
+            onError: (err) => {
+              streamError = err;
+            },
           });
+
           const durationMs = Math.round(performance.now() - startTime);
-          if (error || !data) {
+
+          if (streamError && !streamResult) {
             result = {
               requestId,
               conversationId: cid,
               status: 'failed',
-              error: error
-                ? apiErrorToAgentError(error)
-                : { code: 'unknown', message: 'Backend agent run failed.' },
+              error: apiErrorToAgentError(streamError),
               startedAt: Date.now(),
               finishedAt: Date.now(),
             };
-            logger.error('ERROR', 'Backend agent run failed', {
+            logger.error('ERROR', 'Backend stream failed', {
               requestId,
-              error_code: result.error?.code ?? 'unknown',
+              error_code: streamError.code,
               durationMs,
             });
-          } else {
-            result = data;
-            logger.info('CHAT', 'Backend response received', {
+          } else if (streamResult) {
+            result = streamResult;
+            logger.info('CHAT', 'Stream completed', {
               requestId,
               status: result.status,
               durationMs,
               resolvedModel: result.meta?.model ?? '(none)',
-              providerReportedModel: result.meta?.providerReportedModel ?? '(unreported)',
-              modelSubstituted: result.meta?.modelSubstituted ?? false,
               simulated: result.meta?.simulated ?? false,
             });
+          } else {
+            // Stream was aborted (user clicked Stop) — no result, no error.
+            result = {
+              requestId,
+              conversationId: cid,
+              status: 'cancelled',
+              startedAt: Date.now(),
+              finishedAt: Date.now(),
+            };
           }
         } else {
           const runtime = getAgentRuntime();
@@ -202,6 +239,8 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
           busy: false,
           lastError: errorMsg,
           lastSimulated: simulated,
+          streamingText: '',
+          isStreaming: false,
         }));
         return result;
       } catch (err) {
@@ -212,7 +251,7 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
           durationMs,
           msg: msg.slice(0, 200),
         });
-        setState((s) => ({ ...s, busy: false, lastError: msg }));
+        setState((s) => ({ ...s, busy: false, lastError: msg, streamingText: '', isStreaming: false }));
         return null;
       } finally {
         controllerRef.current = null;
@@ -229,7 +268,7 @@ export function useAgentChat(opts: UseAgentChatOptions): UseAgentChatReturn {
     if (!config.backendEnabled && conversationId) {
       getAgentRuntime().cancel(conversationId);
     }
-    setState((s) => ({ ...s, busy: false }));
+    setState((s) => ({ ...s, busy: false, isStreaming: false, streamingText: '' }));
   }, [conversationId]);
 
   const clearError = useCallback(() => {
