@@ -22,6 +22,7 @@ from typing import Any, Generator, Optional, Protocol
 import httpx
 
 from app.ssrf import validate_endpoint, safe_request_kwargs
+from app.logging_config import log_provider, log_error, is_debug_enabled
 
 
 # --- Result types ---
@@ -404,6 +405,11 @@ class GeminiAdapter:
     def _model_url(self, base_url: str, model: str, *, stream: bool = False) -> str:
         url = base_url.rstrip("/")
         method = "streamGenerateContent" if stream else "generateContent"
+        # Google's streamGenerateContent returns a JSON array by default.
+        # alt=sse switches it to Server-Sent Events (data: <json> lines),
+        # which is the format our line parser expects.
+        if stream:
+            return f"{url}/models/{model}:{method}?alt=sse&key=API_KEY_PLACEHOLDER"
         return f"{url}/models/{model}:{method}?key=API_KEY_PLACEHOLDER"
 
     def test(self, base_url: str, api_key: str, model: str) -> TestResult:
@@ -524,6 +530,16 @@ class GeminiAdapter:
             payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
         if tools:
             payload["tools"] = [{"functionDeclarations": tools}]
+        # Diagnostic counters (dev only — no secrets or content logged).
+        _dbg = is_debug_enabled()
+        _lines_total = 0
+        _lines_parsed = 0
+        _lines_skipped = 0
+        _text_chunks = 0
+        _tool_chunks = 0
+        _finish_reason_seen: Optional[str] = None
+        _sse_sent = 0
+
         try:
             with httpx.stream(
                 "POST",
@@ -532,11 +548,15 @@ class GeminiAdapter:
                 json=payload,
                 **safe_request_kwargs(timeout=timeout),
             ) as r:
+                if _dbg:
+                    log_provider("Gemini stream response", http_status=r.status_code,
+                                 content_type=r.headers.get("content-type", "(none)"))
                 if r.status_code != 200:
                     body = _safe_json(r)
                     cat, msg = _classify_http_error(r.status_code, body)
                     raise AdapterError(cat, msg, status_code=r.status_code)
                 for line in r.iter_lines():
+                    _lines_total += 1
                     if not line:
                         continue
                     data_str = line
@@ -548,7 +568,13 @@ class GeminiAdapter:
                     try:
                         parsed = _json.loads(data_str)
                     except _json.JSONDecodeError:
+                        _lines_skipped += 1
+                        if _dbg:
+                            log_provider("Gemini stream line skipped (parse error)",
+                                         line_len=len(data_str),
+                                         preview=data_str[:80])
                         continue
+                    _lines_parsed += 1
                     chunks = parsed if isinstance(parsed, list) else [parsed]
                     for chunk in chunks:
                         if not isinstance(chunk, dict):
@@ -563,9 +589,67 @@ class GeminiAdapter:
                         delta_text = self._extract_text(content)
                         tool_calls = self._extract_tool_calls(content)
                         finish = first.get("finishReason")
+                        if finish:
+                            _finish_reason_seen = finish
                         usage = chunk.get("usageMetadata") if isinstance(chunk.get("usageMetadata"), dict) else None
                         if delta_text or tool_calls or finish:
+                            if delta_text:
+                                _text_chunks += 1
+                            if tool_calls:
+                                _tool_chunks += 1
+                            _sse_sent += 1
                             yield StreamChunk(delta=delta_text, tool_calls=tool_calls, finish_reason=finish, usage=usage)
+                if _dbg:
+                    log_provider("Gemini stream diagnostics",
+                                 lines_total=_lines_total,
+                                 lines_parsed=_lines_parsed,
+                                 lines_skipped=_lines_skipped,
+                                 text_chunks=_text_chunks,
+                                 tool_chunks=_tool_chunks,
+                                 finish_reason=_finish_reason_seen or "(none)",
+                                 sse_sent=_sse_sent)
+                # Fallback: if alt=sse was not honored and Gemini returned a JSON
+                # array, no SSE lines will have been parsed. Re-read the full body
+                # and parse it as a JSON array of chunks.
+                if _sse_sent == 0 and _lines_parsed == 0:
+                    if _dbg:
+                        log_provider("Gemini stream fallback: no SSE lines parsed, trying JSON array")
+                    raw_bytes = r.read()
+                    try:
+                        parsed_array = _json.loads(raw_bytes)
+                    except Exception:
+                        parsed_array = None
+                    if isinstance(parsed_array, list):
+                        for chunk in parsed_array:
+                            if not isinstance(chunk, dict):
+                                continue
+                            candidates = chunk.get("candidates") or []
+                            if not candidates:
+                                continue
+                            first = candidates[0]
+                            if not isinstance(first, dict):
+                                continue
+                            content = first.get("content")
+                            delta_text = self._extract_text(content)
+                            tool_calls = self._extract_tool_calls(content)
+                            finish = first.get("finishReason")
+                            if finish:
+                                _finish_reason_seen = finish
+                            usage = chunk.get("usageMetadata") if isinstance(chunk.get("usageMetadata"), dict) else None
+                            if delta_text or tool_calls or finish:
+                                if delta_text:
+                                    _text_chunks += 1
+                                if tool_calls:
+                                    _tool_chunks += 1
+                                _sse_sent += 1
+                                yield StreamChunk(delta=delta_text, tool_calls=tool_calls, finish_reason=finish, usage=usage)
+                        if _dbg:
+                            log_provider("Gemini stream fallback diagnostics",
+                                         array_len=len(parsed_array),
+                                         text_chunks=_text_chunks,
+                                         tool_chunks=_tool_chunks,
+                                         finish_reason=_finish_reason_seen or "(none)",
+                                         sse_sent=_sse_sent)
         except httpx.TimeoutException as exc:
             raise AdapterError(CATEGORY_TIMEOUT, "The Gemini streaming request timed out.") from exc
         except httpx.ConnectError as exc:

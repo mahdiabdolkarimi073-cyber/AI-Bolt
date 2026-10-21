@@ -15,6 +15,7 @@ response when simulation is disabled.
 """
 from __future__ import annotations
 
+import json as _json
 import logging
 import time
 import uuid
@@ -527,10 +528,14 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                     "Use list_files to explore the project structure, read_file to inspect existing code, "
                     "write_file to create or update files, create_directory for folders, search_files to find code, "
                     "rename_path to rename, and delete_path to remove files. "
-                    "Always inspect the project first with list_files before creating files. "
-                    "When the user asks you to create or modify files, use the write_file tool — do not just "
-                    "output code in your text response. After creating files, report what you created and the path. "
-                    "All paths are relative to the project root and validated by the backend."
+                    "Follow these guidelines for efficient tool use:\n"
+                    "1. Use list_files once at the start to understand the project layout. Do not repeatedly list the same directory.\n"
+                    "2. Read a file before modifying it — you need to see existing content to make accurate edits.\n"
+                    "3. Do not read the same file multiple times in one request unless its content has changed.\n"
+                    "4. When the user asks you to create or modify files, use the write_file tool — do not just output code in your text response.\n"
+                    "5. After writing a file, you do not need to read it back to verify — the tool already verifies the write.\n"
+                    "6. When a tool returns an error, examine the error message and adjust your approach rather than repeating the same call.\n"
+                    "7. Report what you created or changed and the file path. All paths are relative to the project root."
                 )
                 messages.append({"role": "system", "content": tool_instruction})
             else:
@@ -653,15 +658,34 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
 
         # --- Tool execution loop ---
         # When tools are enabled and the model returns function calls, execute
-        # them and feed the results back for up to _MAX_TOOL_ROUNDS iterations.
+        # them and feed the results back for up to MAX_TOOL_ROUNDS iterations.
         # The final response must be a text message.
         tools_executed: list[dict] = []
         MAX_TOOL_ROUNDS = 6
         current_messages = list(messages)
+        # Accumulate any text the model produces alongside tool calls so it is
+        # not lost — the model may explain what it is about to do.
+        accumulated_text = result.content or ""
+        # Track (tool_name, args) pairs already executed to avoid redundant calls.
+        seen_tool_calls: set[tuple[str, str]] = set()
+
         for _round in range(MAX_TOOL_ROUNDS):
             if not result.tool_calls or not project_root:
                 break
+            # If the model produced text alongside tool calls, preserve it.
+            if result.content:
+                accumulated_text += result.content
             for tc in result.tool_calls:
+                call_key = (tc.name, _json.dumps(tc.args, sort_keys=True))
+                if call_key in seen_tool_calls:
+                    # Skip duplicate tool call — already executed with same args.
+                    log_backend(
+                        "Agent tool call skipped (duplicate)",
+                        request_id=request_id,
+                        tool=tc.name,
+                    )
+                    continue
+                seen_tool_calls.add(call_key)
                 tool_result = execute_tool_call(project_root, tc.name, tc.args)
                 tools_executed.append({
                     "name": tc.name,
@@ -683,7 +707,7 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                 })
                 current_messages.append({
                     "role": "user",
-                    "content": f"Tool '{tc.name}' result: {tool_result}",
+                    "content": f"Tool '{tc.name}' result: {_json.dumps(tool_result)}",
                 })
             # Re-call the adapter with the updated conversation.
             try:
@@ -728,6 +752,8 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                 )
         # After the loop, result should be a text response.
         final_content = result.content or ""
+        if accumulated_text and not final_content:
+            final_content = accumulated_text
         if not final_content and tools_executed:
             # The model only produced tool calls with no final summary — build one.
             summary_parts = [f"I executed {len(tools_executed)} tool operation(s):"]
@@ -760,7 +786,7 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                 "model": model,
                 "simulated": False,
                 "finishReason": result.finish_reason,
-                "usage": result.usage,
+                "usage": _safe_usage(result.usage),
                 "requestId": request_id,
                 "selectedModel": selected_model or None,
                 "modelSubstituted": model_substituted,

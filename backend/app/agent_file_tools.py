@@ -357,10 +357,12 @@ def tool_read_file(project_root: Path, rel_path: str) -> dict:
 
 
 def tool_write_file(project_root: Path, rel_path: str, content: str, overwrite: bool = True) -> dict:
-    """Create or update a file in the project. Creates parent directories."""
+    """Create or update a file in the project. Creates parent directories.
+    Verifies written content matches what was intended."""
     safe = validate_relative_path(rel_path)
     target = safe_resolve_in_project(project_root, safe)
-    if target.exists() and not overwrite:
+    existed_before = target.exists() and target.is_file()
+    if existed_before and not overwrite:
         return {"error": "File exists and overwrite is false."}
     if len(content.encode("utf-8")) > MAX_TOOL_FILE_BYTES:
         return {"error": f"Content exceeds {MAX_TOOL_FILE_BYTES // 1024 // 1024}MB limit."}
@@ -369,10 +371,16 @@ def tool_write_file(project_root: Path, rel_path: str, content: str, overwrite: 
         target.write_text(content, encoding="utf-8")
     except OSError as exc:
         return {"error": f"Write failed: {exc}"}
-    # Verify the file was actually written.
+    # Verify the file was actually written and content matches.
     if not target.exists() or not target.is_file():
         return {"error": "Write verification failed: file does not exist after write."}
-    return {"path": safe, "bytesWritten": len(content.encode("utf-8")), "created": not target.exists()}
+    try:
+        written = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"error": "Write verification failed: could not read back the file."}
+    if len(written) != len(content):
+        return {"error": f"Write verification failed: expected {len(content)} chars, found {len(written)}."}
+    return {"path": safe, "bytesWritten": len(content.encode("utf-8")), "created": not existed_before}
 
 
 def tool_create_directory(project_root: Path, rel_path: str) -> dict:

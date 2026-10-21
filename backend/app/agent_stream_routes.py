@@ -262,11 +262,17 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                     tools_for_adapter = GEMINI_TOOL_DECLARATIONS
                     tool_instruction = (
                         "You have access to workspace tools to inspect and modify the active project. "
-                        "Use list_files to explore, read_file to inspect code, "
-                        "write_file to create or update files. "
-                        "When the user asks you to create or modify files, use write_file. "
-                        "After creating files, report what you created and the path. "
-                        "All paths are relative to the project root."
+                        "Use list_files to explore the project structure, read_file to inspect existing code, "
+                        "write_file to create or update files, create_directory for folders, search_files to find code, "
+                        "rename_path to rename, and delete_path to remove files. "
+                        "Follow these guidelines for efficient tool use:\n"
+                        "1. Use list_files once at the start to understand the project layout. Do not repeatedly list the same directory.\n"
+                        "2. Read a file before modifying it — you need to see existing content to make accurate edits.\n"
+                        "3. Do not read the same file multiple times in one request unless its content has changed.\n"
+                        "4. When the user asks you to create or modify files, use the write_file tool — do not just output code in your text response.\n"
+                        "5. After writing a file, you do not need to read it back to verify — the tool already verifies the write.\n"
+                        "6. When a tool returns an error, examine the error message and adjust your approach rather than repeating the same call.\n"
+                        "7. Report what you created or changed and the file path. All paths are relative to the project root."
                     )
                     messages.append({"role": "system", "content": tool_instruction})
 
@@ -277,6 +283,7 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
             provider_model: Optional[str] = None
             finish_reason: Optional[str] = None
             usage: Optional[dict] = None
+            seen_tool_calls: set[tuple[str, str]] = set()
 
             current_messages = list(messages)
             req_t0 = time.time()
@@ -324,6 +331,12 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
 
                 # Execute tools and feed results back.
                 for tc in accumulated_tool_calls:
+                    call_key = (tc.name, _json.dumps(tc.args, sort_keys=True))
+                    if call_key in seen_tool_calls:
+                        log_backend("Agent tool call skipped (duplicate)",
+                                    request_id=request_id, tool=tc.name)
+                        continue
+                    seen_tool_calls.add(call_key)
                     yield _sse("tool_start", {"name": tc.name, "args": tc.args})
                     yield _sse("activity", {"status": "tool", "message": _activity_for_tool(tc.name),
                                             "fileName": tc.args.get("path") if isinstance(tc.args, dict) else None})
