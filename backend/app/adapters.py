@@ -17,6 +17,7 @@ return structured results the caller can serialize safely.
 from __future__ import annotations
 
 import json as _json
+import logging
 from typing import Any, Generator, Optional, Protocol
 
 import httpx
@@ -147,8 +148,97 @@ def _classify_http_error(status_code: int, body: Any) -> tuple[str, str]:
     if status_code == 404:
         return CATEGORY_INVALID_MODEL, "Model or endpoint not found."
     if 500 <= status_code < 600:
-        return CATEGORY_PROVIDER_ERROR, f"Provider error (HTTP {status_code})."
-    return CATEGORY_PROVIDER_ERROR, f"Provider returned HTTP {status_code}."
+        msg = f"Provider error (HTTP {status_code})."
+        if body_text:
+            msg = f"{msg} {body_text[:300]}"
+        return CATEGORY_PROVIDER_ERROR, msg
+    msg = f"Provider returned HTTP {status_code}."
+    if body_text:
+        msg = f"{msg} {body_text[:300]}"
+    return CATEGORY_PROVIDER_ERROR, msg
+
+
+def _extract_provider_error_detail(body: Any) -> dict:
+    """Extract structured error details from a provider error response for logging.
+
+    Returns a dict with safe, bounded fields. No secrets, API keys, or auth headers
+    are included — only the provider's structured error code, status, and message.
+    """
+    detail: dict = {}
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            if err.get("code") is not None:
+                detail["errorCode"] = err["code"]
+            if err.get("status") is not None:
+                detail["errorStatus"] = err["status"]
+            msg = err.get("message")
+            if isinstance(msg, str):
+                detail["errorMessage"] = msg[:500]
+            if err.get("details") is not None:
+                try:
+                    detail["errorDetails"] = _json.dumps(err["details"], ensure_ascii=False)[:800]
+                except Exception:
+                    detail["errorDetails"] = str(err["details"])[:800]
+        elif isinstance(err, str):
+            detail["errorMessage"] = err[:500]
+        if body.get("promptFeedback") is not None:
+            try:
+                detail["promptFeedback"] = _json.dumps(body["promptFeedback"], ensure_ascii=False)[:400]
+            except Exception:
+                pass
+    elif isinstance(body, str):
+        detail["errorMessage"] = body[:500]
+    return detail
+
+
+def _summarize_gemini_contents(contents: list[dict]) -> dict:
+    """Build a safe summary of the Gemini contents array for diagnostic logging.
+
+    Logs only roles and part types (functionCall/functionResponse names), never
+    text content, arguments, or response data.
+    """
+    entries = []
+    for c in contents:
+        if not isinstance(c, dict):
+            continue
+        role = c.get("role", "?")
+        parts = c.get("parts") or []
+        part_summary = []
+        for p in parts:
+            if not isinstance(p, dict):
+                continue
+            if "text" in p:
+                part_summary.append("text")
+            elif "functionCall" in p:
+                fc = p.get("functionCall", {})
+                part_summary.append(f"functionCall({fc.get('name', '?')})")
+            elif "functionResponse" in p:
+                fr = p.get("functionResponse", {})
+                part_summary.append(f"functionResponse({fr.get('name', '?')})")
+            else:
+                part_summary.append("unknown")
+        entries.append({"role": role, "parts": part_summary})
+    return {"count": len(contents), "entries": entries}
+
+
+def _read_streaming_body(response: httpx.Response) -> Any:
+    """Read and parse the body from a streaming httpx response.
+
+    In streaming mode, the body may not be fully buffered. This reads it
+    first, then attempts to parse as JSON. Returns parsed JSON, raw text, or None.
+    """
+    try:
+        response.read()
+    except Exception:
+        pass
+    try:
+        return response.json()
+    except Exception:
+        try:
+            return response.text[:1000] if response.text else None
+        except Exception:
+            return None
 
 
 # --- OpenAI-compatible adapter ---
@@ -280,7 +370,30 @@ class OpenAICompatibleAdapter:
                 **safe_request_kwargs(timeout=timeout),
             ) as r:
                 if r.status_code != 200:
-                    body = _safe_json(r)
+                    try:
+                        body = _read_streaming_body(r)
+                    except Exception as read_exc:
+                        log_error("OpenAI stream — failed to read error body", exc=read_exc)
+                        body = None
+                    err_detail = _extract_provider_error_detail(body)
+                    log_provider("OpenAI stream — provider error response",
+                                 http_status=r.status_code,
+                                 model=model,
+                                 content_type=r.headers.get("content-type", "(none)"),
+                                 error_detail=err_detail)
+                    log_agent("OpenAI stream — provider error diagnostics",
+                              model=model,
+                              http_status=r.status_code,
+                              error_code=err_detail.get("errorCode"),
+                              error_status=err_detail.get("errorStatus"),
+                              error_message=err_detail.get("errorMessage", "")[:200],
+                              error_details=err_detail.get("errorDetails", "")[:200],
+                              message_count=len(messages),
+                              message_roles=[m.get("role", "?") for m in messages],
+                              has_tools=bool(tools),
+                              tools_count=len(tools) if tools else 0,
+                              tool_names=[t.get("name", "?") for t in tools] if tools else [],
+                              level=logging.ERROR)
                     cat, msg = _classify_http_error(r.status_code, body)
                     raise AdapterError(cat, msg, status_code=r.status_code)
                 for line in r.iter_lines():
@@ -483,6 +596,25 @@ class GeminiAdapter:
             raise AdapterError(CATEGORY_NETWORK_ERROR, "Network error contacting the Gemini endpoint.") from exc
         if r.status_code != 200:
             body = _safe_json(r)
+            err_detail = _extract_provider_error_detail(body)
+            log_provider("Gemini chat — provider error response",
+                         http_status=r.status_code,
+                         model=model,
+                         content_type=r.headers.get("content-type", "(none)"),
+                         error_detail=err_detail)
+            log_agent("Gemini chat — provider error diagnostics",
+                      model=model,
+                      http_status=r.status_code,
+                      error_code=err_detail.get("errorCode"),
+                      error_status=err_detail.get("errorStatus"),
+                      error_message=err_detail.get("errorMessage", "")[:200],
+                      error_details=err_detail.get("errorDetails", "")[:200],
+                      prompt_feedback=err_detail.get("promptFeedback", ""),
+                      contents_summary=_summarize_gemini_contents(contents),
+                      has_system_instruction=bool(system_instruction),
+                      tools_count=len(tools) if tools else 0,
+                      tool_names=[t.get("name", "?") for t in tools] if tools else [],
+                      level=logging.ERROR)
             cat, msg = _classify_http_error(r.status_code, body)
             raise AdapterError(cat, msg, status_code=r.status_code)
         body = _safe_json(r)
@@ -566,7 +698,30 @@ class GeminiAdapter:
                     log_provider("Gemini stream response", http_status=r.status_code,
                                  content_type=r.headers.get("content-type", "(none)"))
                 if r.status_code != 200:
-                    body = _safe_json(r)
+                    try:
+                        body = _read_streaming_body(r)
+                    except Exception as read_exc:
+                        log_error("Gemini stream — failed to read error body", exc=read_exc)
+                        body = None
+                    err_detail = _extract_provider_error_detail(body)
+                    log_provider("Gemini stream — provider error response",
+                                 http_status=r.status_code,
+                                 model=model,
+                                 content_type=r.headers.get("content-type", "(none)"),
+                                 error_detail=err_detail)
+                    log_agent("Gemini stream — provider error diagnostics",
+                              model=model,
+                              http_status=r.status_code,
+                              error_code=err_detail.get("errorCode"),
+                              error_status=err_detail.get("errorStatus"),
+                              error_message=err_detail.get("errorMessage", "")[:200],
+                              error_details=err_detail.get("errorDetails", "")[:200],
+                              prompt_feedback=err_detail.get("promptFeedback", ""),
+                              contents_summary=_summarize_gemini_contents(contents),
+                              has_system_instruction=bool(system_instruction),
+                              tools_count=len(tools) if tools else 0,
+                              tool_names=[t.get("name", "?") for t in tools] if tools else [],
+                              level=logging.ERROR)
                     cat, msg = _classify_http_error(r.status_code, body)
                     raise AdapterError(cat, msg, status_code=r.status_code)
                 for line in r.iter_lines():

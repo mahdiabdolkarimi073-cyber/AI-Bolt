@@ -328,6 +328,18 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                     accumulated_tool_calls: list = []
                     round_finish = None
                     round_usage = None
+                    log_agent("Stream round — sending to provider",
+                              request_id=request_id,
+                              round_idx=round_idx,
+                              model=model,
+                              message_count=len(current_messages),
+                              message_roles=[m.get("role", "?") for m in current_messages],
+                              message_has_tool_calls=sum(1 for m in current_messages if m.get("tool_calls")),
+                              message_has_tool_result=sum(1 for m in current_messages if m.get("tool_result")),
+                              last_message_role=current_messages[-1].get("role", "?") if current_messages else "(none)",
+                              last_message_has_tool_result=bool(current_messages[-1].get("tool_result")) if current_messages else False,
+                              tools_count=len(tools_for_adapter),
+                              level=logging.DEBUG if is_debug_enabled() else logging.INFO)
                     for chunk in adapter.chat_stream(
                         connection["baseUrl"], secret, model, current_messages,
                         timeout=timeout_s, tools=tools_for_adapter,
@@ -352,6 +364,19 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                               round_idx=round_idx,
                               error_code=exc.category,
                               error_msg=str(exc)[:200],
+                              level=logging.ERROR)
+                    log_agent("Stream adapter error — message structure diagnostics",
+                              request_id=request_id,
+                              round_idx=round_idx,
+                              model=model,
+                              message_count=len(current_messages),
+                              message_roles=[m.get("role", "?") for m in current_messages],
+                              message_has_tool_calls=sum(1 for m in current_messages if m.get("tool_calls")),
+                              message_has_tool_result=sum(1 for m in current_messages if m.get("tool_result")),
+                              last_message_role=current_messages[-1].get("role", "?") if current_messages else "(none)",
+                              last_message_has_tool_result=bool(current_messages[-1].get("tool_result")) if current_messages else False,
+                              tools_executed_this_round=len(accumulated_tool_calls),
+                              tools_executed_names=[tc.name for tc in accumulated_tool_calls] if accumulated_tool_calls else [],
                               level=logging.ERROR)
                     yield _sse("error", {"code": exc.category, "message": str(exc)})
                     return
@@ -388,6 +413,14 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                     break
 
                 # Execute tools and feed results back.
+                # Collect all tool calls and results for this round, then append
+                # them as a single assistant (model) turn with all functionCalls
+                # and a single user turn with all functionResponses. Gemini
+                # requires this pairing — separate turns per tool call cause
+                # HTTP 400 errors in subsequent rounds.
+                round_tool_calls: list[dict] = []
+                round_tool_results: list[dict] = []
+
                 for tc in accumulated_tool_calls:
                     call_key = (tc.name, _json.dumps(tc.args, sort_keys=True))
                     if call_key in seen_tool_calls:
@@ -452,13 +485,21 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                             yield _sse("activity", {"status": "saved", "message": f"{'Created' if fc['action'] == 'created' else 'Saved'} {fc['path']}",
                                                     "fileName": fc["path"]})
 
+                    round_tool_calls.append({"name": tc.name, "args": tc.args})
+                    round_tool_results.append({"name": tc.name, "result": tool_result})
+
+                # Append all functionCalls as one model turn and all
+                # functionResponses as one user turn — Gemini requires this
+                # structure for multi-tool rounds.
+                if round_tool_calls:
                     current_messages.append({
                         "role": "assistant", "content": "",
-                        "tool_calls": [{"name": tc.name, "args": tc.args}],
+                        "tool_calls": round_tool_calls,
                     })
+                for tr in round_tool_results:
                     current_messages.append({
                         "role": "user", "content": "",
-                        "tool_result": {"name": tc.name, "result": tool_result},
+                        "tool_result": tr,
                     })
 
                 yield _sse("activity", {"status": "continuing", "message": "AI is continuing after tool execution"})
