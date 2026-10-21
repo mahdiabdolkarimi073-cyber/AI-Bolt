@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import time
 from typing import Any, Generator, Optional, Protocol
 
 import httpx
@@ -53,12 +54,16 @@ CATEGORY_NOT_CONFIGURED = "not_configured"
 
 class ToolCall:
     """A single function/tool call extracted from a provider response."""
-    def __init__(self, *, name: str, args: dict):
+    def __init__(self, *, name: str, args: dict, thought_signature: Optional[str] = None):
         self.name = name
         self.args = args
+        self.thought_signature = thought_signature
 
     def to_dict(self) -> dict:
-        return {"name": self.name, "args": self.args}
+        d = {"name": self.name, "args": self.args}
+        if self.thought_signature is not None:
+            d["thought_signature"] = self.thought_signature
+        return d
 
 
 class ChatResult:
@@ -239,6 +244,19 @@ def _read_streaming_body(response: httpx.Response) -> Any:
             return response.text[:1000] if response.text else None
         except Exception:
             return None
+
+
+def _classify_httpx_timeout(exc: httpx.TimeoutException) -> str:
+    """Classify the phase where an httpx timeout occurred based on the exception subclass."""
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "connect"
+    if isinstance(exc, httpx.ReadTimeout):
+        return "read_stream"
+    if isinstance(exc, httpx.WriteTimeout):
+        return "write_request"
+    if isinstance(exc, httpx.PoolTimeout):
+        return "connection_pool"
+    return "unknown"
 
 
 # --- OpenAI-compatible adapter ---
@@ -685,6 +703,7 @@ class GeminiAdapter:
         _tool_chunks = 0
         _finish_reason_seen: Optional[str] = None
         _sse_sent = 0
+        _stream_t0 = time.time()
 
         try:
             with httpx.stream(
@@ -828,12 +847,60 @@ class GeminiAdapter:
                                          finish_reason=_finish_reason_seen or "(none)",
                                          sse_sent=_sse_sent)
         except httpx.TimeoutException as exc:
+            _phase = _classify_httpx_timeout(exc)
+            _elapsed_ms = int((time.time() - _stream_t0) * 1000)
+            _chained = type(exc.__cause__).__name__ if exc.__cause__ else None
+            log_error("Gemini streaming timeout",
+                      exception_type=type(exc).__name__,
+                      error_category=CATEGORY_TIMEOUT,
+                      model=model,
+                      timeout_phase=_phase,
+                      elapsed_ms=_elapsed_ms,
+                      chained_exception_type=_chained or "(none)")
+            log_agent("Gemini stream — timeout diagnostics",
+                      model=model,
+                      error_category=CATEGORY_TIMEOUT,
+                      exception_type=type(exc).__name__,
+                      timeout_phase=_phase,
+                      elapsed_ms=_elapsed_ms,
+                      chained_exception_type=_chained or "(none)",
+                      level=logging.ERROR)
             raise AdapterError(CATEGORY_TIMEOUT, "The Gemini streaming request timed out.") from exc
         except httpx.ConnectError as exc:
+            _elapsed_ms = int((time.time() - _stream_t0) * 1000)
+            _chained = type(exc.__cause__).__name__ if exc.__cause__ else None
+            log_error("Gemini streaming connection error",
+                      exception_type=type(exc).__name__,
+                      error_category=CATEGORY_NETWORK_ERROR,
+                      model=model,
+                      elapsed_ms=_elapsed_ms,
+                      chained_exception_type=_chained or "(none)")
+            log_agent("Gemini stream — connection error diagnostics",
+                      model=model,
+                      error_category=CATEGORY_NETWORK_ERROR,
+                      exception_type=type(exc).__name__,
+                      elapsed_ms=_elapsed_ms,
+                      chained_exception_type=_chained or "(none)",
+                      level=logging.ERROR)
             raise AdapterError(CATEGORY_NETWORK_ERROR, "Could not connect to the Gemini endpoint.") from exc
         except httpx.HTTPError as exc:
             if isinstance(exc, AdapterError):
                 raise
+            _elapsed_ms = int((time.time() - _stream_t0) * 1000)
+            _chained = type(exc.__cause__).__name__ if exc.__cause__ else None
+            log_error("Gemini streaming HTTP error",
+                      exception_type=type(exc).__name__,
+                      error_category=CATEGORY_NETWORK_ERROR,
+                      model=model,
+                      elapsed_ms=_elapsed_ms,
+                      chained_exception_type=_chained or "(none)")
+            log_agent("Gemini stream — HTTP error diagnostics",
+                      model=model,
+                      error_category=CATEGORY_NETWORK_ERROR,
+                      exception_type=type(exc).__name__,
+                      elapsed_ms=_elapsed_ms,
+                      chained_exception_type=_chained or "(none)",
+                      level=logging.ERROR)
             raise AdapterError(CATEGORY_NETWORK_ERROR, "Network error during Gemini streaming.") from exc
 
     def list_models(self, base_url: str, api_key: str, *, timeout: float = 20.0) -> ListModelsResult:
@@ -893,9 +960,19 @@ class GeminiAdapter:
                     if not (tc and isinstance(tc, list)):
                         break
                     for entry in tc:
-                        parts.append({"functionCall": {"name": entry["name"], "args": entry.get("args", {})}})
+                        fc_part: dict = {"name": entry["name"], "args": entry.get("args", {})}
+                        thought_sig = entry.get("thought_signature")
+                        if isinstance(thought_sig, str) and thought_sig:
+                            fc_part["thoughtSignature"] = thought_sig
+                        parts.append({"functionCall": fc_part})
                     i += 1
                 contents.append({"role": "model", "parts": parts})
+                _sig_count = sum(1 for p in parts if isinstance(p, dict) and isinstance(p.get("functionCall", {}).get("thoughtSignature"), str))
+                log_agent("Gemini _to_gemini_contents — model turn serialized",
+                          part_count=len(parts),
+                          parts_with_signature=_sig_count,
+                          parts_without_signature=len(parts) - _sig_count,
+                          level=logging.DEBUG if is_debug_enabled() else logging.INFO)
                 continue
             # Messages with tool_result represent the function response —
             # emit them as "user" role with functionResponse parts per Gemini spec.
@@ -938,11 +1015,18 @@ class GeminiAdapter:
         return "\n\n".join(parts)
 
     def _extract_tool_calls(self, content: Any) -> list[ToolCall]:
-        """Extract function calls from a Gemini candidate content."""
+        """Extract function calls from a Gemini candidate content.
+
+        Gemini returns the thought signature as ``thoughtSignature`` (camelCase).
+        Some proxy/SDK wrappers may use ``thought_signature`` (snake_case) — we
+        check both so the signature is never silently dropped.
+        """
         if not isinstance(content, dict):
             return []
         parts = content.get("parts") or []
         calls: list[ToolCall] = []
+        _sigs_found = 0
+        _sigs_missing = 0
         for p in parts:
             if not isinstance(p, dict):
                 continue
@@ -951,8 +1035,25 @@ class GeminiAdapter:
                 continue
             name = fc.get("name")
             args = fc.get("args")
+            thought_sig = fc.get("thoughtSignature") or fc.get("thought_signature")
             if isinstance(name, str) and name:
-                calls.append(ToolCall(name=name, args=args if isinstance(args, dict) else {}))
+                sig_val = thought_sig if isinstance(thought_sig, str) and thought_sig else None
+                if sig_val:
+                    _sigs_found += 1
+                else:
+                    _sigs_missing += 1
+                calls.append(ToolCall(
+                    name=name,
+                    args=args if isinstance(args, dict) else {},
+                    thought_signature=sig_val,
+                ))
+        if calls:
+            log_agent("Gemini _extract_tool_calls — signature diagnostics",
+                      tool_call_count=len(calls),
+                      tool_call_names=[c.name for c in calls],
+                      signatures_found=_sigs_found,
+                      signatures_missing=_sigs_missing,
+                      level=logging.DEBUG if is_debug_enabled() else logging.INFO)
         return calls
 
     def _extract_text(self, content: Any) -> str:

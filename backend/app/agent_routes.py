@@ -703,10 +703,15 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
             # If the model produced text alongside tool calls, preserve it.
             if result.content:
                 accumulated_text += result.content
+            # Execute all tool calls, then append them as a single assistant
+            # turn (all functionCalls) and a single user turn (all
+            # functionResponses). Gemini requires this pairing — separate
+            # turns per tool call cause HTTP 400 errors in subsequent rounds.
+            round_tool_calls: list[dict] = []
+            round_tool_results: list[dict] = []
             for tc in result.tool_calls:
                 call_key = (tc.name, _json.dumps(tc.args, sort_keys=True))
                 if call_key in seen_tool_calls:
-                    # Skip duplicate tool call — already executed with same args.
                     log_agent("Tool call skipped (duplicate)",
                               request_id=request_id,
                               tool=tc.name,
@@ -732,8 +737,6 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                           error=tool_result.get("error", "")[:200] if "error" in tool_result else "(none)",
                           exit_code=tool_result.get("exitCode", "(n/a)"),
                           level=logging.DEBUG if is_debug_enabled() else logging.INFO)
-                # If create_project succeeded, update project_root so subsequent
-                # file tools work on the new project.
                 if tc.name == "create_project" and "error" not in tool_result and tool_result.get("projectId"):
                     new_root = resolve_project_root(tool_result["projectId"])
                     if new_root:
@@ -753,17 +756,22 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                                 "Do NOT stop after creating the project — complete all requested work."
                             ),
                         })
-                # Append the model's function call and the function response to
-                # the conversation so the next round has full context.
+                tc_entry: dict = {"name": tc.name, "args": tc.args}
+                if getattr(tc, "thought_signature", None):
+                    tc_entry["thought_signature"] = tc.thought_signature
+                round_tool_calls.append(tc_entry)
+                round_tool_results.append({"name": tc.name, "result": tool_result})
+            if round_tool_calls:
                 current_messages.append({
                     "role": "assistant",
                     "content": "",
-                    "tool_calls": [{"name": tc.name, "args": tc.args}],
+                    "tool_calls": round_tool_calls,
                 })
+            for tr in round_tool_results:
                 current_messages.append({
                     "role": "user",
                     "content": "",
-                    "tool_result": {"name": tc.name, "result": tool_result},
+                    "tool_result": tr,
                 })
             # Re-call the adapter with the updated conversation.
             try:
