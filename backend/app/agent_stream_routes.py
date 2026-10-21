@@ -183,12 +183,23 @@ def _detect_file_changes(tool_name: str, tool_args: dict, tool_result: dict) -> 
                 "oldPath": tool_result.get("fromPath", "")}
     if tool_name == "create_project":
         files = tool_result.get("fileList", [])
+        ws_path = tool_result.get("workspacePath", "")
+        project_id = tool_result.get("projectId", "")
+        cli_used = tool_result.get("cliUsed", False)
         if files:
             return {"path": files[0], "action": "created",
                     "projectCreated": True,
-                    "workspacePath": tool_result.get("workspacePath", ""),
-                    "projectId": tool_result.get("projectId", ""),
-                    "files": files}
+                    "workspacePath": ws_path,
+                    "projectId": project_id,
+                    "files": files,
+                    "cliUsed": cli_used}
+        if ws_path:
+            return {"path": ws_path, "action": "created",
+                    "projectCreated": True,
+                    "workspacePath": ws_path,
+                    "projectId": project_id,
+                    "files": [],
+                    "cliUsed": cli_used}
         return None
     return None
 
@@ -277,6 +288,7 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
             # return a helpful error. This lets the agent scaffold new
             # projects from an empty workspace.
             tools_for_adapter = GEMINI_TOOL_DECLARATIONS
+            tool_instr_idx = len(messages)
             messages.append({"role": "system", "content": build_tool_instruction(project_root is not None)})
 
             yield _sse("activity", {"status": "thinking", "message": "AI is analyzing your request"})
@@ -362,12 +374,15 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                                 new_root = resolve_project_root(fc["projectId"])
                                 if new_root:
                                     project_root = new_root
+                                    messages[tool_instr_idx] = {
+                                        "role": "system",
+                                        "content": build_tool_instruction(True),
+                                    }
+                                    current_messages = list(messages)
                                     current_messages.append({
                                         "role": "system",
                                         "content": (
                                             "A project has been created and is now the active project. "
-                                            "You now have full access to file tools (list_files, read_file, write_file, etc.), "
-                                            "run_command, detect_runtime, and install_deps. "
                                             f"The project root is: {fc.get('workspacePath', '')}. "
                                             "Continue with the next steps: list files, install dependencies, or write additional files as needed. "
                                             "Do NOT stop after creating the project — complete all requested work."

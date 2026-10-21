@@ -480,8 +480,9 @@ def tool_delete_path(project_root: Path, rel_path: str) -> dict:
 import subprocess  # noqa: E402
 import sys as _sys  # noqa: E402
 
-AGENT_CMD_TIMEOUT_S = 60.0
-AGENT_CMD_MAX_OUTPUT = 50_000  # characters
+AGENT_CMD_TIMEOUT_S = 300.0
+AGENT_CMD_MAX_OUTPUT = 80_000  # characters
+AGENT_CMD_TIMEOUT_INSTALL_S = 600.0  # 10 min for installs / scaffolding
 
 
 def _shell_argv(command: str) -> list[str]:
@@ -518,7 +519,7 @@ def tool_run_command(project_root: Path, command: str, timeout_s: float = AGENT_
             cwd=str(project_root),
             capture_output=True,
             text=True,
-            timeout=min(timeout_s, AGENT_CMD_TIMEOUT_S),
+            timeout=min(timeout_s, AGENT_CMD_TIMEOUT_INSTALL_S),
             env=env,
             stdin=subprocess.DEVNULL,
         )
@@ -587,7 +588,7 @@ def tool_install_deps(project_root: Path) -> dict:
         "uv": "uv sync",
         "composer": "composer install",
     }.get(pm, f"{pm} install")
-    result = tool_run_command(project_root, install_cmd, timeout_s=120.0)
+    result = tool_run_command(project_root, install_cmd, timeout_s=AGENT_CMD_TIMEOUT_INSTALL_S)
     result["packageManager"] = pm
     result["installCommand"] = install_cmd
     return result
@@ -600,12 +601,76 @@ def _sanitize_project_name(name: str) -> str:
     return safe or "project"
 
 
+_CLI_SCAFFOLD_COMMANDS = {
+    "next": [
+        {"tool": "npx", "cmd_tmpl": "npx --yes create-next-app@latest {name} --ts --eslint --app --no-src-dir --import-alias \"@/*\" --use-npm"},
+        {"tool": "npm", "cmd_tmpl": "npm init next-app --yes {name} --ts --eslint"},
+    ],
+    "nextjs": [
+        {"tool": "npx", "cmd_tmpl": "npx --yes create-next-app@latest {name} --ts --eslint --app --no-src-dir --import-alias \"@/*\" --use-npm"},
+    ],
+    "nest": [
+        {"tool": "npx", "cmd_tmpl": "npx --yes @nestjs/cli new {name} --package-manager npm --skip-git --skip-install"},
+    ],
+    "nestjs": [
+        {"tool": "npx", "cmd_tmpl": "npx --yes @nestjs/cli new {name} --package-manager npm --skip-git --skip-install"},
+    ],
+    "vite-react": [
+        {"tool": "npm", "cmd_tmpl": "npm create vite@latest {name} -- --template react-ts"},
+        {"tool": "npx", "cmd_tmpl": "npx --yes create-vite {name} --template react-ts"},
+    ],
+    "vite": [
+        {"tool": "npm", "cmd_tmpl": "npm create vite@latest {name} -- --template react-ts"},
+        {"tool": "npx", "cmd_tmpl": "npx --yes create-vite {name} --template react-ts"},
+    ],
+}
+
+
+def _try_cli_scaffold(tech_stack: str, safe_name: str, base: Path) -> Optional[dict]:
+    """Attempt to scaffold a project using the real CLI tool. Returns a dict
+    with the created directory path and CLI output, or None if no CLI tool is
+    available."""
+    from app.execution import detect_tool as _dt
+    stack_key = tech_stack.lower().strip()
+    commands = _CLI_SCAFFOLD_COMMANDS.get(stack_key)
+    if not commands:
+        return None
+    for entry in commands:
+        tool_name = entry["tool"]
+        tool_path = _dt(tool_name)
+        if not tool_path:
+            continue
+        cmd = entry["cmd_tmpl"].format(name=safe_name)
+        # Run the CLI command in the workspace root.
+        result = tool_run_command(base, cmd, timeout_s=AGENT_CMD_TIMEOUT_INSTALL_S)
+        if result.get("success"):
+            created_dir = base / safe_name
+            if created_dir.exists() and created_dir.is_dir():
+                return {
+                    "workspacePath": safe_name,
+                    "cliUsed": True,
+                    "cliTool": tool_name,
+                    "cliCommand": cmd,
+                    "cliOutput": (result.get("stdout", "") or "")[:2000],
+                    "target": created_dir,
+                }
+        # CLI failed — clean up partial output and try the next option.
+        partial = base / safe_name
+        if partial.exists():
+            import shutil as _shutil
+            _shutil.rmtree(partial, ignore_errors=True)
+    return None
+
+
 def tool_create_project(project_root: Path, project_name: str, tech_stack: str, description: str = "") -> dict:
     """Create a new project directory structure inside the workspace root.
     tech_stack selects the scaffold template: next, nest, vite-react, fastapi,
     django, php, laravel, wordpress-plugin, express, node.
     The project is created as a subdirectory of the workspace root (NOT inside
-    the current project root). Returns the relative workspace path."""
+    the current project root). Returns the relative workspace path.
+    For supported stacks (next, nest, vite-react), the real CLI tool is tried
+    first (create-next-app, @nestjs/cli, create-vite). If the CLI tool is not
+    installed, falls back to the built-in static scaffold."""
     from app.config import workspace_root_path
     from app.db import connect
     from app.repositories import ProjectRepo
@@ -618,13 +683,15 @@ def tool_create_project(project_root: Path, project_name: str, tech_stack: str, 
     while (base / candidate).exists():
         suffix += 1
         candidate = f"{safe_name}-{suffix}"
-    target = base / candidate
-    target.mkdir(parents=True, exist_ok=False)
+    # Update safe_name to the unique candidate for CLI commands
+    safe_name = candidate
 
     scaffold = _SCAFFOLDS.get(tech_stack.lower().strip())
     if not scaffold:
         # Unknown stack — create empty dir and return. The model can then use
         # write_file to populate it.
+        target = base / candidate
+        target.mkdir(parents=True, exist_ok=False)
         return {
             "workspacePath": candidate,
             "projectName": project_name,
@@ -632,11 +699,33 @@ def tool_create_project(project_root: Path, project_name: str, tech_stack: str, 
             "note": f"No built-in scaffold for '{tech_stack}'. Directory created empty. Use write_file to add project files.",
         }
 
-    files = scaffold(project_name, description)
-    for rel_path, content in files:
-        fp = target / rel_path
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content, encoding="utf-8")
+    # Step 1: Try CLI scaffolding for supported stacks.
+    cli_result = _try_cli_scaffold(tech_stack, safe_name, base)
+    files: list[tuple[str, str]] = []
+    cli_used = False
+    cli_info: dict = {}
+    target = base / candidate
+
+    if cli_result and cli_result.get("target"):
+        cli_used = True
+        cli_info = {
+            "cliUsed": True,
+            "cliTool": cli_result.get("cliTool", ""),
+            "cliCommand": cli_result.get("cliCommand", ""),
+        }
+        target = cli_result["target"]
+    else:
+        # Step 2: Fall back to static scaffold. If CLI partially created the
+        # directory, clean it up first.
+        if target.exists():
+            import shutil as _shutil
+            _shutil.rmtree(target, ignore_errors=True)
+        target.mkdir(parents=True, exist_ok=False)
+        files = scaffold(project_name, description)
+        for rel_path, content in files:
+            fp = target / rel_path
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(content, encoding="utf-8")
 
     # Register the project in the DB so it appears in the Explorer.
     with connect() as conn:
@@ -648,19 +737,23 @@ def tool_create_project(project_root: Path, project_name: str, tech_stack: str, 
                 path=candidate,
                 template=tech_stack,
                 workspace_path=candidate,
-                import_source="agent-scaffold",
+                import_source="agent-cli-scaffold" if cli_used else "agent-scaffold",
             )
         else:
             project = existing
 
-    return {
+    result = {
         "workspacePath": candidate,
         "projectName": project_name,
         "techStack": tech_stack,
         "projectId": project["id"],
-        "filesCreated": len(files),
-        "fileList": [fp for fp, _ in files],
+        "filesCreated": len(files) if not cli_used else -1,
+        "fileList": [fp for fp, _ in files] if not cli_used else [],
     }
+    if cli_used:
+        result.update(cli_info)
+        result["note"] = f"Project created via {cli_info.get('cliTool', 'CLI')}. Use list_files to inspect the generated structure."
+    return result
 
 
 # --- Environment template tool ---
@@ -1210,13 +1303,13 @@ TOOL_SYSTEM_INSTRUCTION = (
     "- delete_path: Delete a file or directory (not the root).\n"
     "\n"
     "COMMAND & RUNTIME TOOLS:\n"
-    "- run_command: Run a finite shell command (build, test, lint, migrations). Returns stdout, stderr, exitCode. Max 60s timeout.\n"
+    "- run_command: Run a finite shell command (build, test, lint, migrations, installs). Returns stdout, stderr, exitCode. Timeout up to 300s (600s for installs).\n"
     "- detect_runtime: Detect the project's framework, language, package manager, and available/missing tools.\n"
     "- install_deps: Install dependencies using the detected package manager (npm install, pip install, composer install, etc.).\n"
     "- get_env_template: Get required env variables for a tech stack (next, nest, vite-react, fastapi, django, php, laravel, wordpress-plugin, express, node).\n"
     "\n"
     "PROJECT SCAFFOLDING:\n"
-    "- create_project: Create a new project with a standard scaffold. Available stacks: next, nest, vite-react, fastapi, django, php, laravel, wordpress-plugin, express, node.\n"
+    "- create_project: Create a new project. For next/nest/vite-react, tries the real CLI first (create-next-app, @nestjs/cli, create-vite). Falls back to static scaffold if CLI is not installed. Also available: fastapi, django, php, laravel, wordpress-plugin, express, node.\n"
     "  This creates the project under the workspace root, generates config files, and registers it.\n"
     "\n"
     "GUIDELINES:\n"
@@ -1225,7 +1318,7 @@ TOOL_SYSTEM_INSTRUCTION = (
     "3. Read a file before modifying it.\n"
     "4. Use write_file to create/modify files — do not just output code in text.\n"
     "5. After writing files, use install_deps if dependencies need installing.\n"
-    "6. Use run_command for build, test, lint, and migrations. Check exitCode to determine success.\n"
+    "6. Use run_command for build, test, lint, migrations, and dependency installs. Check exitCode to determine success. Timeout is 300s for normal commands, 600s for installs.\n"
     "7. When a tool returns an error, examine the error and adjust — do not repeat the same call.\n"
     "8. For env variables, use get_env_template to learn what's needed. Do NOT fabricate secret values.\n"
     "9. When the user asks for a new project, use create_project with the appropriate techStack.\n"
@@ -1248,8 +1341,7 @@ def build_tool_instruction(has_project: bool) -> str:
         "File tools (list_files, read_file, write_file, etc.) and command tools (run_command, "
         "detect_runtime, install_deps) require an active project — they will return an error.\n"
         "However, you CAN use these tools right now:\n"
-        "- create_project: Create a new project with a standard scaffold. Available stacks: "
-        "next, nest, vite-react, fastapi, django, php, laravel, wordpress-plugin, express, node.\n"
+        "- create_project: Create a new project. For next/nest/vite-react, the real CLI is tried first. Also: fastapi, django, php, laravel, wordpress-plugin, express, node.\n"
         "- get_env_template: Get required env variables for a tech stack.\n"
         "\n"
         "When the user asks to create, build, or scaffold a project, use create_project with the "
@@ -1358,7 +1450,7 @@ GEMINI_TOOL_DECLARATIONS: list[dict] = [
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The shell command to execute."},
-                "timeout": {"type": "number", "description": "Timeout in seconds (default 60, max 60)."},
+                "timeout": {"type": "number", "description": "Timeout in seconds (default 300, max 600 for installs)."},
             },
             "required": ["command"],
         },
@@ -1381,7 +1473,7 @@ GEMINI_TOOL_DECLARATIONS: list[dict] = [
     },
     {
         "name": "create_project",
-        "description": "Create a new project with a standard scaffold for the requested technology. Creates a directory under the workspace root, generates config files and boilerplate, and registers it in the project list. Available stacks: next, nest, vite-react, fastapi, django, php, laravel, wordpress-plugin, express, node.",
+        "description": "Create a new project for the requested technology. For next/nest/vite-react, the real CLI tool (create-next-app, @nestjs/cli, create-vite) is tried first if installed. Falls back to static scaffold. Also available: fastapi, django, php, laravel, wordpress-plugin, express, node. Creates a directory under the workspace root and registers it in the project list.",
         "parameters": {
             "type": "object",
             "properties": {
