@@ -169,8 +169,13 @@ export function AppShell() {
       if (result?.assistantMessage && (result.meta?.simulated || result.assistantMessage.simulated)) {
         setSimulatedIds((prev) => new Set(prev).add(result.assistantMessage!.id));
       }
+      // If the agent executed filesystem tools, refresh the Explorer tree so
+      // newly created/modified files appear immediately.
+      if (result?.toolsExecuted && result.toolsExecuted.length > 0) {
+        await workspace.refreshTree();
+      }
     },
-    [agent, conversationId, conversationIdRef, projectId],
+    [agent, conversationId, conversationIdRef, projectId, workspace],
   );
 
   const handleStop = useCallback(() => {
@@ -224,6 +229,7 @@ export function AppShell() {
     async (project: Project) => {
       if (project.workspacePath) {
         await workspace.openProject(project);
+        setSidebarSection('explorer');
       } else {
         workspace.clearError();
       }

@@ -158,6 +158,8 @@ export interface AgentResult {
   meta?: ProviderExecutionMeta;
   /** Phase 7: retrieved memory/knowledge context injected into the run. */
   retrieval?: RetrievalMeta;
+  /** Tools executed by the backend during this run (function calling). */
+  toolsExecuted?: Array<{ name: string; args: Record<string, unknown>; result: Record<string, unknown> }>;
   /** Lifecycle timestamps (ms epoch). */
   startedAt: number;
   finishedAt?: number;

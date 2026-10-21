@@ -36,6 +36,9 @@ from app.agent_file_tools import (
     retrieve_project_context,
     render_project_context_block,
     DEFAULT_PROJECT_CONTEXT_BUDGET_CHARS,
+    resolve_project_root,
+    GEMINI_TOOL_DECLARATIONS,
+    execute_tool_call,
 )
 
 
@@ -83,6 +86,7 @@ class AgentRunResponse(BaseModel):
     meta: Optional[dict] = None
     retrieval: Optional[dict] = None
     projectContext: Optional[dict] = None
+    toolsExecuted: Optional[list[dict]] = None
     startedAt: int
     finishedAt: int
 
@@ -208,7 +212,8 @@ def _log_request_failure(request_id: str, *, resolved_model: str,
 
 
 def _chat_with_retry(adapter, base_url: str, secret: str, model: str,
-                     messages: list[dict], *, timeout: float):
+                     messages: list[dict], *, timeout: float,
+                     tools: Optional[list[dict]] = None):
     """Call adapter.chat with one bounded retry for transient errors only.
 
     Non-retryable errors (auth, invalid model, quota) are raised immediately.
@@ -217,7 +222,7 @@ def _chat_with_retry(adapter, base_url: str, secret: str, model: str,
     last_exc: Optional[Exception] = None
     for attempt in range(_MAX_RETRIES + 1):
         try:
-            return adapter.chat(base_url, secret, model, messages, timeout=timeout)
+            return adapter.chat(base_url, secret, model, messages, timeout=timeout, tools=tools)
         except AdapterError as exc:
             if exc.category in _NON_RETRYABLE or attempt >= _MAX_RETRIES:
                 raise
@@ -508,10 +513,37 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
         exc_msg = ""
         exc_cat = ""
         exc_status: Optional[int] = None
+
+        # Resolve the active project root for tool execution. Tools are only
+        # enabled when a project with an on-disk workspace is active.
+        project_root = None
+        tools_for_adapter = None
+        if body.projectId:
+            project_root = resolve_project_root(body.projectId)
+            if project_root:
+                tools_for_adapter = GEMINI_TOOL_DECLARATIONS
+                tool_instruction = (
+                    "You have access to workspace tools to inspect and modify the active project. "
+                    "Use list_files to explore the project structure, read_file to inspect existing code, "
+                    "write_file to create or update files, create_directory for folders, search_files to find code, "
+                    "rename_path to rename, and delete_path to remove files. "
+                    "Always inspect the project first with list_files before creating files. "
+                    "When the user asks you to create or modify files, use the write_file tool — do not just "
+                    "output code in your text response. After creating files, report what you created and the path. "
+                    "All paths are relative to the project root and validated by the backend."
+                )
+                messages.append({"role": "system", "content": tool_instruction})
+            else:
+                log_backend(
+                    "Project root not available for tools",
+                    request_id=request_id,
+                    project_id=body.projectId,
+                )
+
         try:
             result = _chat_with_retry(
                 adapter, connection["baseUrl"], secret, model, messages,
-                timeout=timeout_s,
+                timeout=timeout_s, tools=tools_for_adapter,
             )
         except AdapterError as exc:
             req_dur = int((time.time() - req_t0) * 1000)
@@ -619,12 +651,97 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
             details=success_details,
         ))
 
+        # --- Tool execution loop ---
+        # When tools are enabled and the model returns function calls, execute
+        # them and feed the results back for up to _MAX_TOOL_ROUNDS iterations.
+        # The final response must be a text message.
+        tools_executed: list[dict] = []
+        MAX_TOOL_ROUNDS = 6
+        current_messages = list(messages)
+        for _round in range(MAX_TOOL_ROUNDS):
+            if not result.tool_calls or not project_root:
+                break
+            for tc in result.tool_calls:
+                tool_result = execute_tool_call(project_root, tc.name, tc.args)
+                tools_executed.append({
+                    "name": tc.name,
+                    "args": tc.args,
+                    "result": tool_result,
+                })
+                log_backend(
+                    "Agent tool executed",
+                    request_id=request_id,
+                    tool=tc.name,
+                    success="error" not in tool_result,
+                )
+                # Append the model's function call and the function response to
+                # the conversation so the next round has full context.
+                current_messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"name": tc.name, "args": tc.args}],
+                })
+                current_messages.append({
+                    "role": "user",
+                    "content": f"Tool '{tc.name}' result: {tool_result}",
+                })
+            # Re-call the adapter with the updated conversation.
+            try:
+                result = _chat_with_retry(
+                    adapter, connection["baseUrl"], secret, model, current_messages,
+                    timeout=timeout_s, tools=tools_for_adapter,
+                )
+            except (AdapterError, Exception) as exc:
+                # If the follow-up call fails, keep the tool results and return
+                # a best-effort response with the error.
+                exc_cat = getattr(exc, "category", "provider_failed")
+                exc_msg = str(getattr(exc, "message", exc)) or "Follow-up provider call failed."
+                assistant_msg = MessageRepo.append(
+                    conn,
+                    conversation_id=body.conversationId,
+                    role="assistant",
+                    content=f"I executed tools but the follow-up response failed: {exc_msg}",
+                )
+                return AgentRunResponse(
+                    requestId=request_id,
+                    conversationId=body.conversationId,
+                    status="completed",
+                    userMessage=user_msg,
+                    assistantMessage=assistant_msg,
+                    toolsExecuted=tools_executed if tools_executed else None,
+                    meta={
+                        "providerId": connection["adapter"],
+                        "connectionId": connection["id"],
+                        "model": model, "simulated": False,
+                        "requestId": request_id,
+                        "selectedModel": selected_model or None,
+                        "modelSubstituted": model_substituted,
+                        "providerReportedModel": provider_model,
+                        "providerResponseId": provider_response_id,
+                        "providerActualModelConfirmed": bool(provider_model),
+                        "error": exc_msg,
+                    },
+                    retrieval={"items": [r.to_dict() for r in retrieved], "chars": retrieval_len},
+                    projectContext={"items": [i.to_dict() for i in project_items], "chars": project_len},
+                    startedAt=started,
+                    finishedAt=int(time.time() * 1000),
+                )
+        # After the loop, result should be a text response.
+        final_content = result.content or ""
+        if not final_content and tools_executed:
+            # The model only produced tool calls with no final summary — build one.
+            summary_parts = [f"I executed {len(tools_executed)} tool operation(s):"]
+            for t in tools_executed:
+                status_txt = "ok" if "error" not in t["result"] else "failed"
+                summary_parts.append(f"- {t['name']}: {status_txt}")
+            final_content = "\n".join(summary_parts)
+
         # Persist the assistant message (authoritative path).
         assistant_msg = MessageRepo.append(
             conn,
             conversation_id=body.conversationId,
             role="assistant",
-            content=result.content,
+            content=final_content,
         )
 
         # Mark the connection status based on success.
@@ -636,6 +753,7 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
             status="completed",
             userMessage=user_msg,
             assistantMessage=assistant_msg,
+            toolsExecuted=tools_executed if tools_executed else None,
             meta={
                 "providerId": connection["adapter"],
                 "connectionId": connection["id"],

@@ -11,6 +11,11 @@ export const config = {
   backendEnabled: Boolean(import.meta.env.VITE_API_BASE_URL),
   defaultProvider: (import.meta.env.VITE_DEFAULT_PROVIDER ?? 'gemini') as ProviderId,
   requestTimeoutMs: 15_000,
+  /** Timeout for agent chat requests. AI generation can take far longer than a
+   *  normal API call, so this sits just above the backend's agent_timeout_seconds
+   *  (120s) to let backend timeout errors surface instead of the frontend
+   *  aborting first and masking the real outcome. */
+  agentRequestTimeoutMs: 125_000,
 } as const;
 
 export type AppConfig = typeof config;

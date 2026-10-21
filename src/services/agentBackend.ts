@@ -1,5 +1,6 @@
 import { request } from '@/lib/http';
 import { logger } from '@/lib/logger';
+import { config } from '@/config';
 import type { ApiResult } from '@/types/domain';
 import type { ProviderId } from '@/types';
 import type { AgentResult, AgentConfig } from '@/types/agent';
@@ -69,6 +70,7 @@ export async function runAgentViaBackend(input: BackendAgentRunInput): Promise<A
     signal: input.signal,
     requestId: input.requestId,
     logPrefix: 'CHAT',
+    timeoutMs: config.agentRequestTimeoutMs,
   });
   if (error) {
     logger.error('CHAT', 'Backend agent run returned error', {
@@ -115,6 +117,7 @@ function toAgentResult(p: AgentRunPayload): AgentResult {
         }
       : undefined,
     retrieval: p.retrieval ? (normalizeRetrieval(p.retrieval) as RetrievalMeta) : undefined,
+    toolsExecuted: p.toolsExecuted,
     startedAt: p.startedAt,
     finishedAt: p.finishedAt,
   };

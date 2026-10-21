@@ -48,14 +48,26 @@ CATEGORY_PROVIDER_ERROR = "provider_error"
 CATEGORY_NOT_CONFIGURED = "not_configured"
 
 
+class ToolCall:
+    """A single function/tool call extracted from a provider response."""
+    def __init__(self, *, name: str, args: dict):
+        self.name = name
+        self.args = args
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "args": self.args}
+
+
 class ChatResult:
     def __init__(self, *, content: str, simulated: bool = False, finish_reason: Optional[str] = None,
-                 usage: Optional[dict] = None, raw_meta: Optional[dict] = None):
+                 usage: Optional[dict] = None, raw_meta: Optional[dict] = None,
+                 tool_calls: Optional[list[ToolCall]] = None):
         self.content = content
         self.simulated = simulated
         self.finish_reason = finish_reason
         self.usage = usage
         self.raw_meta = raw_meta or {}
+        self.tool_calls = tool_calls or []
 
 
 class TestResult:
@@ -86,7 +98,7 @@ class Adapter(Protocol):
         ...
 
     def chat(self, base_url: str, api_key: str, model: str, messages: list[dict],
-             *, timeout: float = 30.0) -> ChatResult:
+             *, timeout: float = 30.0, tools: Optional[list[dict]] = None) -> ChatResult:
         ...
 
     def list_models(self, base_url: str, api_key: str, *, timeout: float = 20.0) -> ListModelsResult:
@@ -185,15 +197,18 @@ class OpenAICompatibleAdapter:
         return TestResult(category=cat, message=msg, status_code=r.status_code)
 
     def chat(self, base_url: str, api_key: str, model: str, messages: list[dict],
-             *, timeout: float = 30.0) -> ChatResult:
+             *, timeout: float = 30.0, tools: Optional[list[dict]] = None) -> ChatResult:
         url = self.validate_config(base_url)
         if not api_key:
             raise AdapterError(CATEGORY_AUTH_FAILED, "No API key available for this connection.")
+        body_payload: dict = {"model": model, "messages": messages, "temperature": 0.2}
+        if tools:
+            body_payload["tools"] = [{"type": "function", "function": t} for t in tools]
         try:
             r = httpx.post(
                 self._chat_url(url),
                 headers=self._headers(api_key, _openrouter_headers(base_url)),
-                json={"model": model, "messages": messages, "temperature": 0.2},
+                json=body_payload,
                 **safe_request_kwargs(timeout=timeout),
             )
         except httpx.TimeoutException as exc:
@@ -337,7 +352,7 @@ class GeminiAdapter:
         return TestResult(category=cat, message=msg, status_code=r.status_code)
 
     def chat(self, base_url: str, api_key: str, model: str, messages: list[dict],
-             *, timeout: float = 30.0) -> ChatResult:
+             *, timeout: float = 30.0, tools: Optional[list[dict]] = None) -> ChatResult:
         url = self.validate_config(base_url)
         if not api_key:
             raise AdapterError(CATEGORY_AUTH_FAILED, "No API key available for this connection.")
@@ -350,6 +365,8 @@ class GeminiAdapter:
         }
         if system_instruction:
             payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+        if tools:
+            payload["tools"] = [{"functionDeclarations": tools}]
         try:
             r = httpx.post(
                 self._model_url(url, model).replace("API_KEY_PLACEHOLDER", _q(api_key)),
@@ -374,9 +391,11 @@ class GeminiAdapter:
         if not candidates:
             raise AdapterError(CATEGORY_PROVIDER_ERROR, "Gemini response had no candidates.")
         first = candidates[0]
-        content = self._extract_text(first.get("content")) if isinstance(first, dict) else ""
-        if not content:
-            raise AdapterError(CATEGORY_PROVIDER_ERROR, "Gemini response had no content.")
+        if not isinstance(first, dict):
+            raise AdapterError(CATEGORY_PROVIDER_ERROR, "Gemini response had no candidates.")
+        content = self._extract_text(first.get("content"))
+        # Extract function calls (tool calls) from the response.
+        tool_calls = self._extract_tool_calls(first.get("content"))
         finish = first.get("finishReason") if isinstance(first, dict) else None
         usage = body.get("usageMetadata") if isinstance(body.get("usageMetadata"), dict) else None
         # Preserve provider-reported metadata so the caller can verify which
@@ -389,11 +408,15 @@ class GeminiAdapter:
             raw_meta["modelVersion"] = model_version
         if response_id:
             raw_meta["responseId"] = response_id
+        # If there are tool calls, content may be empty — that's valid.
+        if not content and not tool_calls:
+            raise AdapterError(CATEGORY_PROVIDER_ERROR, "Gemini response had no content or tool calls.")
         return ChatResult(
             content=content,
             finish_reason=finish,
             usage=usage,
             raw_meta=raw_meta,
+            tool_calls=tool_calls,
         )
 
     def list_models(self, base_url: str, api_key: str, *, timeout: float = 20.0) -> ListModelsResult:
@@ -439,15 +462,51 @@ class GeminiAdapter:
             role = m.get("role")
             if role == "system":
                 continue  # handled separately as systemInstruction
+            # Messages with tool_calls represent the model's function call —
+            # emit them as "model" role with functionCall parts.
+            tool_calls = m.get("tool_calls")
+            if tool_calls and isinstance(tool_calls, list):
+                parts: list[dict] = []
+                for tc in tool_calls:
+                    parts.append({"functionCall": {"name": tc["name"], "args": tc.get("args", {})}})
+                contents.append({"role": "model", "parts": parts})
+                continue
             g_role = "user" if role == "user" else "model"
             contents.append({"role": g_role, "parts": [{"text": m.get("content", "")}]})
         return contents
 
     def _extract_system(self, messages: list[dict]) -> str:
+        """Concatenate ALL system messages into the systemInstruction.
+
+        Multiple system messages are injected by the agent route (user prompt,
+        runtime metadata, retrieval block, project context). Gemini only accepts
+        a single systemInstruction, so they must be joined here.
+        """
+        parts: list[str] = []
         for m in messages:
             if m.get("role") == "system":
-                return str(m.get("content") or "")
-        return ""
+                c = str(m.get("content") or "")
+                if c:
+                    parts.append(c)
+        return "\n\n".join(parts)
+
+    def _extract_tool_calls(self, content: Any) -> list[ToolCall]:
+        """Extract function calls from a Gemini candidate content."""
+        if not isinstance(content, dict):
+            return []
+        parts = content.get("parts") or []
+        calls: list[ToolCall] = []
+        for p in parts:
+            if not isinstance(p, dict):
+                continue
+            fc = p.get("functionCall")
+            if not isinstance(fc, dict):
+                continue
+            name = fc.get("name")
+            args = fc.get("args")
+            if isinstance(name, str) and name:
+                calls.append(ToolCall(name=name, args=args if isinstance(args, dict) else {}))
+        return calls
 
     def _extract_text(self, content: Any) -> str:
         if not isinstance(content, dict):
