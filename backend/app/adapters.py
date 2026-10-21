@@ -698,21 +698,51 @@ class GeminiAdapter:
 
     def _to_gemini_contents(self, messages: list[dict]) -> list[dict]:
         contents: list[dict] = []
-        for m in messages:
+        i = 0
+        while i < len(messages):
+            m = messages[i]
             role = m.get("role")
             if role == "system":
+                i += 1
                 continue  # handled separately as systemInstruction
             # Messages with tool_calls represent the model's function call —
             # emit them as "model" role with functionCall parts.
+            # Merge consecutive tool_calls messages into one model turn.
             tool_calls = m.get("tool_calls")
             if tool_calls and isinstance(tool_calls, list):
                 parts: list[dict] = []
-                for tc in tool_calls:
-                    parts.append({"functionCall": {"name": tc["name"], "args": tc.get("args", {})}})
+                while i < len(messages):
+                    tc = messages[i].get("tool_calls")
+                    if not (tc and isinstance(tc, list)):
+                        break
+                    for entry in tc:
+                        parts.append({"functionCall": {"name": entry["name"], "args": entry.get("args", {})}})
+                    i += 1
                 contents.append({"role": "model", "parts": parts})
+                continue
+            # Messages with tool_result represent the function response —
+            # emit them as "user" role with functionResponse parts per Gemini spec.
+            # Merge consecutive tool_result messages into one user turn.
+            tool_result = m.get("tool_result")
+            if tool_result and isinstance(tool_result, dict):
+                parts: list[dict] = []
+                while i < len(messages):
+                    tr = messages[i].get("tool_result")
+                    if not (tr and isinstance(tr, dict)):
+                        break
+                    name = tr.get("name", "")
+                    result = tr.get("result", {})
+                    if not isinstance(result, dict):
+                        result = {"result": result}
+                    if not result:
+                        result = {"status": "ok"}
+                    parts.append({"functionResponse": {"name": name, "response": result}})
+                    i += 1
+                contents.append({"role": "user", "parts": parts})
                 continue
             g_role = "user" if role == "user" else "model"
             contents.append({"role": g_role, "parts": [{"text": m.get("content", "")}]})
+            i += 1
         return contents
 
     def _extract_system(self, messages: list[dict]) -> str:

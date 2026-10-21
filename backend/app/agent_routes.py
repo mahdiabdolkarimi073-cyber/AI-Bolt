@@ -642,13 +642,14 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
         # them and feed the results back for up to MAX_TOOL_ROUNDS iterations.
         # The final response must be a text message.
         tools_executed: list[dict] = []
-        MAX_TOOL_ROUNDS = 6
+        MAX_TOOL_ROUNDS = 20
         current_messages = list(messages)
         # Accumulate any text the model produces alongside tool calls so it is
         # not lost — the model may explain what it is about to do.
-        accumulated_text = result.content or ""
+        accumulated_text = ""
         # Track (tool_name, args) pairs already executed to avoid redundant calls.
         seen_tool_calls: set[tuple[str, str]] = set()
+        round_limit_hit = False
 
         for _round in range(MAX_TOOL_ROUNDS):
             if not result.tool_calls:
@@ -679,6 +680,23 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                     tool=tc.name,
                     success="error" not in tool_result,
                 )
+                # If create_project succeeded, update project_root so subsequent
+                # file tools work on the new project.
+                if tc.name == "create_project" and "error" not in tool_result and tool_result.get("projectId"):
+                    new_root = resolve_project_root(tool_result["projectId"])
+                    if new_root:
+                        project_root = new_root
+                        current_messages.append({
+                            "role": "system",
+                            "content": (
+                                "A project has been created and is now the active project. "
+                                "You now have full access to file tools (list_files, read_file, write_file, etc.), "
+                                "run_command, detect_runtime, and install_deps. "
+                                f"The project root is: {tool_result.get('workspacePath', '')}. "
+                                "Continue with the next steps: list files, install dependencies, or write additional files as needed. "
+                                "Do NOT stop after creating the project — complete all requested work."
+                            ),
+                        })
                 # Append the model's function call and the function response to
                 # the conversation so the next round has full context.
                 current_messages.append({
@@ -688,7 +706,8 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                 })
                 current_messages.append({
                     "role": "user",
-                    "content": f"Tool '{tc.name}' result: {_json.dumps(tool_result)}",
+                    "content": "",
+                    "tool_result": {"name": tc.name, "result": tool_result},
                 })
             # Re-call the adapter with the updated conversation.
             try:
@@ -731,6 +750,8 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                     startedAt=started,
                     finishedAt=int(time.time() * 1000),
                 )
+            if _round == MAX_TOOL_ROUNDS - 1 and result.tool_calls:
+                round_limit_hit = True
         # After the loop, result should be a text response.
         final_content = result.content or ""
         if accumulated_text and not final_content:
@@ -741,6 +762,9 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
             for t in tools_executed:
                 status_txt = "ok" if "error" not in t["result"] else "failed"
                 summary_parts.append(f"- {t['name']}: {status_txt}")
+            if round_limit_hit:
+                summary_parts.append("")
+                summary_parts.append(f"NOTE: Reached the maximum of {MAX_TOOL_ROUNDS} tool rounds. The task may not be fully complete.")
             final_content = "\n".join(summary_parts)
 
         # Persist the assistant message (authoritative path).

@@ -1231,7 +1231,11 @@ TOOL_SYSTEM_INSTRUCTION = (
     "9. When the user asks for a new project, use create_project with the appropriate techStack.\n"
     "10. Report what you created, changed, or ran, with file paths and exit codes. All paths are relative to the project root.\n"
     "11. Do not run long-running dev servers via run_command. Tell the user to use the terminal panel for that.\n"
-    "12. For WordPress plugins, use create_project with techStack='wordpress-plugin'. This generates the main plugin file, settings page, AJAX handlers, assets, and uninstall.php with proper nonce checks, sanitization, and capability checks."
+    "12. For WordPress plugins, use create_project with techStack='wordpress-plugin'. This generates the main plugin file, settings page, AJAX handlers, assets, and uninstall.php with proper nonce checks, sanitization, and capability checks.\n"
+    "13. COMPLETE THE FULL TASK. Do not stop after one or two tool calls. If the user asked for a project with multiple files or steps, execute ALL of them before giving your final response.\n"
+    "14. After creating a project, continue with: list_files to verify structure, install_deps to install dependencies, and any additional customization requested. Do NOT report success until all steps are done.\n"
+    "15. If a tool fails, try an alternative approach or report the failure honestly. Do NOT claim success when a tool returned an error.\n"
+    "16. Your final response must summarize what was accomplished, what succeeded, what failed, and what the user should do next."
 )
 
 
@@ -1249,8 +1253,15 @@ def build_tool_instruction(has_project: bool) -> str:
         "- get_env_template: Get required env variables for a tech stack.\n"
         "\n"
         "When the user asks to create, build, or scaffold a project, use create_project with the "
-        "appropriate techStack. After creating a project, report the workspacePath and fileList "
-        "from the tool result so the user knows what was created.\n"
+        "appropriate techStack. After create_project succeeds, the project becomes the active project "
+        "and you will have access to all file and command tools.\n"
+        "IMPORTANT: After creating a project, do NOT stop. Continue with these steps:\n"
+        "1. Use list_files to verify the project structure was created.\n"
+        "2. Use install_deps to install dependencies.\n"
+        "3. If the user asked for additional files or customization, use write_file to create them.\n"
+        "4. Report what was created, what succeeded, and what failed. Include file paths and exit codes.\n"
+        "5. Only report the task as complete when all requested work is done. If something failed, say so.\n"
+        "\n"
         "Do NOT claim you lack access to filesystem or project tools — you do have access via "
         "the create_project tool. Use it."
     )

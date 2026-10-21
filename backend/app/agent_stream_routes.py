@@ -64,7 +64,7 @@ import json as _json
 router = APIRouter(prefix="/agent", tags=["agent-stream"])
 logger = logging.getLogger("app.agent_stream")
 
-MAX_TOOL_ROUNDS = 6
+MAX_TOOL_ROUNDS = 20
 
 
 def _sse(event: str, data: dict) -> str:
@@ -358,6 +358,21 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                             })
                             yield _sse("activity", {"status": "saved", "message": f"Created project: {fc.get('workspacePath', '')}",
                                                     "fileName": fc.get("workspacePath", "")})
+                            if fc.get("projectId"):
+                                new_root = resolve_project_root(fc["projectId"])
+                                if new_root:
+                                    project_root = new_root
+                                    current_messages.append({
+                                        "role": "system",
+                                        "content": (
+                                            "A project has been created and is now the active project. "
+                                            "You now have full access to file tools (list_files, read_file, write_file, etc.), "
+                                            "run_command, detect_runtime, and install_deps. "
+                                            f"The project root is: {fc.get('workspacePath', '')}. "
+                                            "Continue with the next steps: list files, install dependencies, or write additional files as needed. "
+                                            "Do NOT stop after creating the project — complete all requested work."
+                                        ),
+                                    })
                         else:
                             yield _sse("file_change", fc)
                             yield _sse("activity", {"status": "saved", "message": f"{'Created' if fc['action'] == 'created' else 'Saved'} {fc['path']}",
@@ -368,12 +383,16 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                         "tool_calls": [{"name": tc.name, "args": tc.args}],
                     })
                     current_messages.append({
-                        "role": "user", "content": f"Tool '{tc.name}' result: {_json.dumps(tool_result)}",
+                        "role": "user", "content": "",
+                        "tool_result": {"name": tc.name, "result": tool_result},
                     })
 
                 yield _sse("activity", {"status": "continuing", "message": "AI is continuing after tool execution"})
 
             req_dur = int((time.time() - req_t0) * 1000)
+
+            # If we hit the round limit with tools still running, report it.
+            round_limit_hit = accumulated_tool_calls and round_idx >= MAX_TOOL_ROUNDS
 
             # If tools ran but no final text, build a summary.
             if not full_text and tools_executed:
@@ -381,6 +400,9 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                 for t in tools_executed:
                     status_txt = "ok" if "error" not in t["result"] else "failed"
                     summary_parts.append(f"- {t['name']}: {status_txt}")
+                if round_limit_hit:
+                    summary_parts.append("")
+                    summary_parts.append(f"NOTE: Reached the maximum of {MAX_TOOL_ROUNDS} tool rounds. The task may not be fully complete.")
                 full_text = "\n".join(summary_parts)
 
             if not full_text and not tools_executed:
