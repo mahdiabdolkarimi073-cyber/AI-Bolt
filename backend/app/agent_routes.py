@@ -42,6 +42,12 @@ from app.agent_file_tools import (
     execute_tool_call,
     build_tool_instruction,
 )
+from app.experience_retrieval import (
+    should_use_local,
+    build_local_response,
+    log_decision as log_experience_decision,
+)
+from app.experience_repos import ExperienceRepo
 
 
 # Categories that should never be retried — retrying won't help.
@@ -89,6 +95,7 @@ class AgentRunResponse(BaseModel):
     retrieval: Optional[dict] = None
     projectContext: Optional[dict] = None
     toolsExecuted: Optional[list[dict]] = None
+    experienceRouting: Optional[dict] = None
     startedAt: int
     finishedAt: int
 
@@ -276,6 +283,92 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
         )
 
         connection = _resolve_connection(conn, body.connectionId)
+
+        # --- Experience-based local routing ---
+        # Before contacting Gemini, check if a confirmed local experience
+        # can answer this request. This reduces Gemini calls for repetitive
+        # tasks. The decision is logged for measuring savings.
+        experience_routing: Optional[dict] = None
+        exp_decision = None
+        exp_match = None
+        exp_t0 = time.time()
+        try:
+            framework = None
+            if body.projectId:
+                from app.runtime_detect import detect_runtime
+                try:
+                    rt = detect_runtime(resolve_project_root(body.projectId))
+                    framework = rt.framework
+                except Exception:
+                    pass
+            exp_decision, exp_match = should_use_local(
+                conn,
+                message=body.message,
+                project_id=body.projectId,
+                framework=framework,
+                has_open_project=bool(body.projectId),
+            )
+            experience_routing = exp_decision.to_dict()
+        except Exception:  # noqa: BLE001
+            exp_decision = None
+            exp_match = None
+
+        # If local experience is confident enough, return it directly.
+        if exp_decision and exp_decision.use_local and exp_match:
+            local_content = build_local_response(exp_match)
+            assistant_msg = MessageRepo.append(
+                conn,
+                conversation_id=body.conversationId,
+                role="assistant",
+                content=local_content,
+            )
+            exp_dur = int((time.time() - exp_t0) * 1000)
+            try:
+                ExperienceRepo.increment_reuse(conn, exp_decision.experience_id)
+            except Exception:
+                pass
+            try:
+                log_experience_decision(
+                    conn,
+                    request_id=request_id,
+                    conversation_id=body.conversationId,
+                    decision=exp_decision,
+                    project_id=body.projectId,
+                    success=True,
+                    duration_ms=exp_dur,
+                )
+            except Exception:
+                pass
+            return AgentRunResponse(
+                requestId=request_id,
+                conversationId=body.conversationId,
+                status="completed",
+                userMessage=user_msg,
+                assistantMessage=assistant_msg,
+                meta={
+                    "providerId": "local_experience",
+                    "simulated": False,
+                    "finishReason": "stop",
+                    "requestId": request_id,
+                    "experienceId": exp_decision.experience_id,
+                },
+                experienceRouting=experience_routing,
+                startedAt=started,
+                finishedAt=int(time.time() * 1000),
+            )
+
+        # Log the Gemini routing decision (even when no match was found).
+        if exp_decision:
+            try:
+                log_experience_decision(
+                    conn,
+                    request_id=request_id,
+                    conversation_id=body.conversationId,
+                    decision=exp_decision,
+                    project_id=body.projectId,
+                )
+            except Exception:
+                pass
 
         # No real connection configured.
         if not connection or not connection["enabled"]:
@@ -851,6 +944,40 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
         # Mark the connection status based on success.
         ConnectionRepo.update(conn, connection["id"], status="connected")
 
+        # --- Post-run experience capture (proposed, not confirmed) ---
+        # After a successful Gemini call, automatically register a proposed
+        # experience so the user can confirm it later. Only non-trivial
+        # responses are captured (short acknowledgments are skipped). Content
+        # is sanitized for secrets before storage.
+        proposed_exp_id: Optional[str] = None
+        try:
+            if final_content and len(final_content.strip()) > 100:
+                preview = body.message.strip().split("\n")[0][:200]
+                solution_preview = final_content.strip()[:4000]
+                tool_names_used = [t["name"] for t in tools_executed] if tools_executed else []
+                exp_title = preview[:120] if len(preview) <= 120 else preview[:117] + "..."
+                exp_tags = ["auto-captured"]
+                if tool_names_used:
+                    exp_tags.extend(tool_names_used[:5])
+                exp = ExperienceRepo.create(
+                    conn,
+                    title=exp_title,
+                    problem_description=body.message[:8000],
+                    solution_pattern=solution_preview,
+                    project_type=None,
+                    framework=None,
+                    files_involved=tool_names_used,
+                    tags=exp_tags,
+                    status="proposed",
+                    confidence=0,
+                    conversation_id=body.conversationId,
+                    project_id=body.projectId,
+                    source="agent_auto",
+                )
+                proposed_exp_id = exp.get("id")
+        except Exception:  # noqa: BLE001 — experience capture must never fail the run
+            pass
+
         return AgentRunResponse(
             requestId=request_id,
             conversationId=body.conversationId,
@@ -871,6 +998,7 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                 "providerReportedModel": provider_model,
                 "providerResponseId": provider_response_id,
                 "providerActualModelConfirmed": bool(provider_model),
+                "proposedExperienceId": proposed_exp_id,
             },
             retrieval={
                 "items": [r.to_dict() for r in retrieved],
@@ -880,6 +1008,7 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                 "items": [i.to_dict() for i in project_items],
                 "chars": project_len,
             },
+            experienceRouting=experience_routing,
             startedAt=started,
             finishedAt=int(time.time() * 1000),
         )

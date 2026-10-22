@@ -235,9 +235,14 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                 yield _sse("error", {"code": "not_found", "message": "Conversation not found"})
                 return
 
-            user_msg = MessageRepo.append(
-                conn, conversation_id=body.conversationId, role="user", content=body.message,
-            )
+            try:
+                user_msg = MessageRepo.append(
+                    conn, conversation_id=body.conversationId, role="user", content=body.message,
+                )
+            except Exception as exc:
+                log_error("Streaming DB error — failed to persist user message", exc=exc, request_id=request_id)
+                yield _sse("error", {"code": "database_error", "message": "Failed to save your message. Please try again."})
+                return
             yield _sse("start", {"requestId": request_id, "conversationId": body.conversationId, "userMessage": user_msg})
 
             messages, connection, model, model_substituted, retrieved, \
@@ -539,10 +544,15 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                 full_text = "(No response generated.)"
 
             # Persist the assistant message once.
-            assistant_msg = MessageRepo.append(
-                conn, conversation_id=body.conversationId, role="assistant", content=full_text,
-            )
-            ConnectionRepo.update(conn, connection["id"], status="connected")
+            try:
+                assistant_msg = MessageRepo.append(
+                    conn, conversation_id=body.conversationId, role="assistant", content=full_text,
+                )
+                ConnectionRepo.update(conn, connection["id"], status="connected")
+            except Exception as exc:
+                log_error("Streaming DB error — failed to persist assistant message", exc=exc, request_id=request_id)
+                yield _sse("error", {"code": "database_error", "message": "The response was generated but could not be saved. Please try again."})
+                return
 
             safe_usage = _safe_usage(usage)
             _log_request_success(request_id, resolved_model=model, provider_model=provider_model,

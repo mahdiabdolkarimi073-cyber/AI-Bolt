@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>تست محیط Preview</title>
+    <style>
+        :root {
+            --bg-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --card-bg: rgba(255, 255, 255, 0.95);
+            --text-color: #2d3748;
+            --primary: #5a67d4;
+            --primary-hover: #4c51bf;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: var(--bg-gradient);
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            color: var(--text-color);
+        }
+
+        .card {
+            background: var(--card-bg);
+            padding: 2.5rem 3rem;
+            border-radius: 1.5rem;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2), 0 10px 10px -5px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            max-width: 420px;
+            width: 100%;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            animation: fadeIn 0.8s ease-out;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            margin-bottom: 1.5rem;
+            color: #1a202c;
+            font-weight: 700;
+        }
+
+        .badge {
+            display: inline-block;
+            background-color: #ebf8ff;
+            color: #3182ce;
+            padding: 0.5rem 1rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            margin-bottom: 1.5rem;
+            border: 1px solid #bee3f8;
+        }
+
+        .counter-section {
+            margin-top: 1.5rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid #e2e8f0;
+        }
+
+        .counter-display {
+            font-size: 2.5rem;
+            font-weight: 800;
+            color: var(--primary);
+            margin-bottom: 1rem;
+        }
+
+        .btn {
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
+            font-weight: 600;
+            border-radius: 0.75rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 6px rgba(90, 103, 212, 0.3);
+            width: 100%;
+        }
+
+        .btn:hover {
+            background-color: var(--primary-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 6px 8px rgba(90, 103, 212, 0.4);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .footer-note {
+            margin-top: 1.5rem;
+            font-size: 0.75rem;
+            color: #718096;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>تست محیط Preview</h1>
+        <div class="badge">Preview با موفقیت اجرا شد</div>
+        
+        <div class="counter-section">
+            <div id="counter" class="counter-display">0</div>
+            <button id="incrementBtn" class="btn">افزایش شمارنده</button>
+        </div>
+
+        <div class="footer-note">پورت اختصاصی: ۳۰۰۱ | تعامل زنده فعال است</div>
+    </div>
+
+    <script>
+        let count = 0;
+        const counterEl = document.getElementById('counter');
+        const btnEl = document.getElementById('incrementBtn');
+
+        btnEl.addEventListener('click', () => {
+            count++;
+            counterEl.textContent = count;
+            counterEl.style.transform = 'scale(1.1)';
+            setTimeout(() => {
+                counterEl.style.transform = 'scale(1)';
+            }, 150);
+        });
+    </script>
+</body>
+</html>

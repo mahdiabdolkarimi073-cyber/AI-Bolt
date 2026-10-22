@@ -128,6 +128,7 @@ export interface StreamCallbacks {
   onToolStart: (event: { name: string; args: Record<string, unknown> }) => void;
   onToolResult: (event: { name: string; result: Record<string, unknown> }) => void;
   onProjectCreated?: (event: { projectId: string; workspacePath: string; files: string[] }) => void;
+  onStart?: (event: { requestId: string; conversationId: string; userMessage: Record<string, unknown> }) => void;
   onDone: (result: AgentResult) => void;
   onError: (error: { code: string; message: string }) => void;
 }
@@ -301,6 +302,14 @@ function parseSSEEvent(raw: string, callbacks: StreamCallbacks, input: BackendAg
   const rid = input.requestId ?? '(none)';
 
   switch (event) {
+    case 'start':
+      logger.debug('AGENT_DEBUG', 'Stream — start event', { requestId: rid, conversationId: data.conversationId });
+      callbacks.onStart?.({
+        requestId: data.requestId as string,
+        conversationId: data.conversationId as string,
+        userMessage: (data.userMessage as Record<string, unknown>) ?? {},
+      });
+      break;
     case 'delta':
       callbacks.onDelta(data.text as string);
       break;

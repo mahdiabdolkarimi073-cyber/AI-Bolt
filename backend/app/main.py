@@ -25,6 +25,7 @@ from app.memory_routes import router as memory_router, kb_router as knowledge_ro
 from app.terminal_routes import router as terminal_router
 from app.snapshot_routes import router as snapshot_router
 from app.diagnostics_routes import router as diagnostics_router
+from app.experience_routes import router as experience_router
 from app.preview_routes import router as preview_router, init_preview_table
 from app.execution import mark_stale_sessions_stopped, process_manager
 
@@ -79,6 +80,7 @@ app.include_router(knowledge_router)
 app.include_router(terminal_router)
 app.include_router(snapshot_router)
 app.include_router(diagnostics_router)
+app.include_router(experience_router)
 app.include_router(preview_router)
 
 

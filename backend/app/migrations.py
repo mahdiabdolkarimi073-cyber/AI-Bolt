@@ -362,4 +362,83 @@ MIGRATIONS: list[tuple[str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_diag_created ON connection_diagnostics(created_at DESC);
         """,
     ),
+    (
+        "0008_coding_experiences",
+        """
+        -- Coding experiences learned by the Agent. Each record captures a
+        -- reusable solution pattern, problem context, and outcome. Distinct
+        -- from memories/knowledge: experiences are structured, outcome-tracked,
+        -- and reusable for reducing Gemini calls.
+        CREATE TABLE IF NOT EXISTS coding_experiences (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            problem_description TEXT NOT NULL,
+            solution_pattern TEXT NOT NULL,
+            project_type TEXT,
+            framework TEXT,
+            framework_versions TEXT NOT NULL DEFAULT '[]',
+            files_involved TEXT NOT NULL DEFAULT '[]',
+            tags TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'proposed'
+                CHECK (status IN ('proposed','confirmed','failed','superseded')),
+            confidence INTEGER NOT NULL DEFAULT 0,
+            times_reused INTEGER NOT NULL DEFAULT 0,
+            conversation_id TEXT,
+            project_id TEXT,
+            source TEXT NOT NULL DEFAULT 'agent',
+            failure_note TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            confirmed_at INTEGER,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_exp_project ON coding_experiences(project_id);
+        CREATE INDEX IF NOT EXISTS idx_exp_status ON coding_experiences(status);
+        CREATE INDEX IF NOT EXISTS idx_exp_framework ON coding_experiences(framework);
+        CREATE INDEX IF NOT EXISTS idx_exp_confidence ON coding_experiences(confidence DESC);
+
+        -- FTS index for experiences.
+        CREATE VIRTUAL TABLE IF NOT EXISTS experiences_fts USING fts5(
+            title, problem_description, solution_pattern, tags,
+            content='coding_experiences',
+            content_rowid='rowid',
+            tokenize='porter unicode61 remove_diacritics 1'
+        );
+        CREATE TRIGGER IF NOT EXISTS exp_ai AFTER INSERT ON coding_experiences BEGIN
+            INSERT INTO experiences_fts(rowid, title, problem_description, solution_pattern, tags)
+            VALUES (new.rowid, new.title, new.problem_description, new.solution_pattern, new.tags);
+        END;
+        CREATE TRIGGER IF NOT EXISTS exp_ad AFTER DELETE ON coding_experiences BEGIN
+            INSERT INTO experiences_fts(experiences_fts, rowid, title, problem_description, solution_pattern, tags)
+            VALUES ('delete', old.rowid, old.title, old.problem_description, old.solution_pattern, old.tags);
+        END;
+        CREATE TRIGGER IF NOT EXISTS exp_au AFTER UPDATE ON coding_experiences BEGIN
+            INSERT INTO experiences_fts(experiences_fts, rowid, title, problem_description, solution_pattern, tags)
+            VALUES ('delete', old.rowid, old.title, old.problem_description, old.solution_pattern, old.tags);
+            INSERT INTO experiences_fts(rowid, title, problem_description, solution_pattern, tags)
+            VALUES (new.rowid, new.title, new.problem_description, new.solution_pattern, new.tags);
+        END;
+
+        -- Agent decision log: records whether each request used Gemini or a
+        -- local experience, and why. Used for measuring savings.
+        CREATE TABLE IF NOT EXISTS agent_decision_log (
+            id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL,
+            conversation_id TEXT,
+            decision TEXT NOT NULL CHECK (decision IN ('local_experience','gemini','simulation')),
+            reason TEXT NOT NULL DEFAULT '',
+            experience_id TEXT,
+            project_id TEXT,
+            framework TEXT,
+            confidence INTEGER NOT NULL DEFAULT 0,
+            success INTEGER,
+            duration_ms INTEGER,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (experience_id) REFERENCES coding_experiences(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_deci_request ON agent_decision_log(request_id);
+        CREATE INDEX IF NOT EXISTS idx_deci_decision ON agent_decision_log(decision);
+        CREATE INDEX IF NOT EXISTS idx_deci_created ON agent_decision_log(created_at DESC);
+        """,
+    ),
 ]
