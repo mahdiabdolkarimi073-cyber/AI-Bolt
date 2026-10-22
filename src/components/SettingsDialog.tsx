@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Dialog } from './ui/Dialog';
 import { Button } from './ui/Button';
 import { ConnectionsPanel } from './ConnectionsPanel';
+import { ProfilesPanel } from './ProfilesPanel';
 import { MemoryPanel } from './MemoryPanel';
 
 interface Props {
@@ -10,7 +11,7 @@ interface Props {
   onSave: () => void;
 }
 
-const sections = ['AI Connections', 'Memory', 'General', 'Editor', 'Appearance', 'Shortcuts'] as const;
+const sections = ['AI Connections', 'Model Profiles', 'Memory', 'General', 'Editor', 'Appearance', 'Shortcuts'] as const;
 
 export function SettingsDialog({ open, onClose, onSave }: Props) {
   const [section, setSection] = useState<(typeof sections)[number]>('AI Connections');
@@ -57,6 +58,8 @@ export function SettingsDialog({ open, onClose, onSave }: Props) {
 
         <div className="min-w-0 flex-1">
           {section === 'AI Connections' && <ConnectionsPanel />}
+
+          {section === 'Model Profiles' && <ProfilesPanel />}
 
           {section === 'Memory' && <MemoryPanel />}
 

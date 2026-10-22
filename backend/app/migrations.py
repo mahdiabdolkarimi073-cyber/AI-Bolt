@@ -441,4 +441,57 @@ MIGRATIONS: list[tuple[str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_deci_created ON agent_decision_log(created_at DESC);
         """,
     ),
+    (
+        "0009_model_profiles",
+        """
+        -- Model profiles (fallback chains). A profile is a named, ordered list
+        -- of candidate models drawn from configured connections. When a request
+        -- fails on the primary candidate, the next eligible candidate is tried.
+        -- A profile can be selected per-project or per-task.
+        CREATE TABLE IF NOT EXISTS model_profiles (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        -- Ordered candidates within a profile. Each references a specific
+        -- connection + model_id. priority is a 1-based ordinal (1 = primary).
+        CREATE TABLE IF NOT EXISTS profile_candidates (
+            id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL,
+            connection_id TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 1,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            label TEXT,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (profile_id) REFERENCES model_profiles(id) ON DELETE CASCADE,
+            FOREIGN KEY (connection_id) REFERENCES api_connections(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_pc_profile ON profile_candidates(profile_id);
+        CREATE INDEX IF NOT EXISTS idx_pc_priority ON profile_candidates(profile_id, priority ASC);
+
+        -- Optional per-project profile assignment. When set, the project's
+        -- agent requests use this profile's fallback chain instead of the
+        -- default connection/model. When absent, the agent default is used.
+        CREATE TABLE IF NOT EXISTS project_profile_assignments (
+            project_id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL,
+            assigned_at INTEGER NOT NULL,
+            FOREIGN KEY (profile_id) REFERENCES model_profiles(id) ON DELETE CASCADE,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+
+        -- Default profile for new conversations (single row, like agent_defaults).
+        CREATE TABLE IF NOT EXISTS default_profile (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            profile_id TEXT,
+            FOREIGN KEY (profile_id) REFERENCES model_profiles(id) ON DELETE SET NULL
+        );
+        INSERT OR IGNORE INTO default_profile (id) VALUES (1);
+        """,
+    ),
 ]

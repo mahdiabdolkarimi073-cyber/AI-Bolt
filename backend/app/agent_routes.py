@@ -1014,6 +1014,175 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
         )
 
 
+class ProfileRunRequest(BaseModel):
+    conversationId: str = Field(min_length=1, max_length=120)
+    message: str = Field(min_length=1, max_length=32000)
+    profileId: str = Field(min_length=1, max_length=120)
+    systemPrompt: Optional[str] = Field(default=None, max_length=4000)
+    maxContextChars: int = Field(default=24000, ge=0, le=200000)
+    maxHistoryMessages: int = Field(default=20, ge=0, le=200)
+    projectId: Optional[str] = Field(default=None, max_length=120)
+    maxRetrievalChars: int = Field(default=DEFAULT_RETRIEVAL_BUDGET_CHARS, ge=0, le=20000)
+    maxProjectContextChars: int = Field(default=DEFAULT_PROJECT_CONTEXT_BUDGET_CHARS, ge=0, le=20000)
+
+
+class ProfileRunResponse(BaseModel):
+    requestId: str
+    conversationId: str
+    status: str
+    userMessage: Optional[dict] = None
+    assistantMessage: Optional[dict] = None
+    error: Optional[dict] = None
+    meta: Optional[dict] = None
+    failoverEvents: Optional[list[dict]] = None
+    startedAt: int
+    finishedAt: int
+
+
+@router.post("/run/profile", response_model=ProfileRunResponse)
+def run_agent_with_profile(body: ProfileRunRequest, x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id")):
+    """Run the agent using a model profile's fallback chain.
+
+    Instead of resolving a single connection+model, this endpoint resolves all
+    enabled candidates in the profile and tries them in priority order. When a
+    candidate fails with a retryable error, the next candidate is tried.
+    """
+    from app.failover import run_with_failover
+    from app.profile_repos import ProfileRepo
+
+    started = int(time.time() * 1000)
+    request_id = (x_request_id or "").strip() or str(uuid.uuid4())
+
+    with connect() as conn:
+        conv = ConversationRepo.get(conn, body.conversationId)
+        if not conv:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
+
+        prof = ProfileRepo.get(conn, body.profileId)
+        if not prof:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Profile not found")
+        if not prof["enabled"]:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Profile is disabled")
+
+        user_msg = MessageRepo.append(
+            conn,
+            conversation_id=body.conversationId,
+            role="user",
+            content=body.message,
+        )
+
+        # Build context (reuse the same retrieval + project context logic).
+        retrieved = []
+        retrieval_block = ""
+        try:
+            retrieved = retrieve_context(
+                conn, message=body.message, project_id=body.projectId,
+                budget_chars=body.maxRetrievalChars,
+            )
+            retrieval_block = render_context_block(retrieved)
+        except Exception:
+            pass
+
+        project_items = []
+        project_block = ""
+        try:
+            project_items = retrieve_project_context(
+                body.projectId, body.message, body.maxProjectContextChars,
+            )
+            project_block = render_project_context_block(project_items)
+        except Exception:
+            pass
+
+        history = MessageRepo.list(conn, body.conversationId)
+        prior = [m for m in history if m["id"] != user_msg["id"]]
+        if body.maxHistoryMessages > 0 and len(prior) > body.maxHistoryMessages:
+            prior = prior[-body.maxHistoryMessages:]
+
+        retrieval_len = len(retrieval_block)
+        project_len = len(project_block)
+        if body.maxContextChars > 0:
+            kept = []
+            used = retrieval_len + project_len
+            for m in reversed(prior):
+                cost = len(m["content"]) + 1
+                if used + cost > body.maxContextChars:
+                    break
+                kept.insert(0, m)
+                used += cost
+            prior = kept
+
+        # Build the full prompt for the failover engine.
+        full_prompt_parts: list[str] = []
+        if body.systemPrompt:
+            full_prompt_parts.append(body.systemPrompt)
+        if retrieval_block:
+            full_prompt_parts.append(retrieval_block)
+        if project_block:
+            full_prompt_parts.append(project_block)
+        for m in prior:
+            full_prompt_parts.append(f"{m['role']}: {m['content']}")
+        full_prompt_parts.append(f"user: {body.message}")
+        full_prompt = "\n\n".join(full_prompt_parts)
+
+        result = run_with_failover(
+            profile_id=body.profileId,
+            prompt=full_prompt,
+            system_prompt=body.systemPrompt,
+            project_id=body.projectId,
+        )
+
+        failover_events = [
+            {
+                "type": e.type,
+                "candidateIndex": e.candidate_index,
+                "connectionId": e.connection_id,
+                "modelId": e.model_id,
+                "connectionName": e.connection_name,
+                "category": e.category,
+                "message": e.message,
+                "durationMs": e.duration_ms,
+            }
+            for e in result.events
+        ]
+
+        if result.success:
+            assistant_msg = MessageRepo.append(
+                conn,
+                conversation_id=body.conversationId,
+                role="assistant",
+                content=result.content or "(empty response)",
+            )
+            return ProfileRunResponse(
+                requestId=request_id,
+                conversationId=body.conversationId,
+                status="completed",
+                userMessage=user_msg,
+                assistantMessage=assistant_msg,
+                meta={
+                    "connectionId": result.used_connection_id,
+                    "model": result.used_model_id,
+                    "profileId": body.profileId,
+                    "requestId": request_id,
+                    "finishReason": result.finish_reason,
+                },
+                failoverEvents=failover_events,
+                startedAt=started,
+                finishedAt=int(time.time() * 1000),
+            )
+        else:
+            return ProfileRunResponse(
+                requestId=request_id,
+                conversationId=body.conversationId,
+                status="failed",
+                userMessage=user_msg,
+                error={"code": "failover_exhausted", "message": result.error_message},
+                meta={"profileId": body.profileId, "requestId": request_id},
+                failoverEvents=failover_events,
+                startedAt=started,
+                finishedAt=int(time.time() * 1000),
+            )
+
+
 @router.post("/cancel/{cid}", status_code=status.HTTP_202_ACCEPTED)
 def cancel_agent(cid: str):
     """Cancel is best-effort. Synchronous requests are handled client-side."""

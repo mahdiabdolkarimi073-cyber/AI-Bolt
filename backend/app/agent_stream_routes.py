@@ -35,6 +35,7 @@ from app.db import connect
 from app.repositories import ConversationRepo, MessageRepo
 from app.connection_repos import ConnectionRepo, CredentialRepo, AgentDefaultsRepo
 from app.adapters import resolve_adapter, AdapterError, StreamChunk
+from app.diagnostics import DiagnosticsRepo, DiagnosticEvent
 from app.crypto import is_encryption_available
 from app.retrieval import retrieve_context, render_context_block, DEFAULT_RETRIEVAL_BUDGET_CHARS
 from app.agent_file_tools import (
@@ -48,6 +49,7 @@ from app.agent_file_tools import (
 )
 from app.agent_routes import (
     AgentRunRequest,
+    ProfileRunRequest,
     _resolve_connection,
     _safe_usage,
     _build_runtime_system_block,
@@ -574,6 +576,198 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                     "modelSubstituted": model_substituted,
                 },
                 "toolsExecuted": tools_executed if tools_executed else None,
+            })
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/run/profile/stream")
+async def stream_agent_with_profile(body: ProfileRunRequest, x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id")):
+    """Stream agent output using a model profile's fallback chain.
+
+    Tries each candidate in priority order. Emits failover events when a
+    candidate fails so the UI can show which models were tried.
+    """
+    from app.profile_repos import ProfileRepo, resolve_candidates
+    from app.failover import _is_retryable
+
+    started = int(time.time() * 1000)
+    request_id = (x_request_id or "").strip() or str(uuid.uuid4())
+
+    def generate():
+        with connect() as conn:
+            conv = ConversationRepo.get(conn, body.conversationId)
+            if not conv:
+                yield _sse("error", {"code": "not_found", "message": "Conversation not found"})
+                return
+
+            prof = ProfileRepo.get(conn, body.profileId)
+            if not prof:
+                yield _sse("error", {"code": "not_found", "message": "Profile not found"})
+                return
+            if not prof["enabled"]:
+                yield _sse("error", {"code": "bad_request", "message": "Profile is disabled"})
+                return
+
+            try:
+                user_msg = MessageRepo.append(
+                    conn, conversation_id=body.conversationId, role="user", content=body.message,
+                )
+            except Exception:
+                yield _sse("error", {"code": "database_error", "message": "Failed to save your message."})
+                return
+
+            yield _sse("start", {"requestId": request_id, "conversationId": body.conversationId, "userMessage": user_msg})
+
+            candidates = resolve_candidates(conn, body.profileId)
+            if not candidates:
+                yield _sse("error", {"code": "no_candidates", "message": "No usable candidates in this profile."})
+                return
+
+            # Build context (simplified — no tool support in profile mode yet).
+            history = MessageRepo.list(conn, body.conversationId)
+            prior = [m for m in history if m["id"] != user_msg["id"]]
+            if body.maxHistoryMessages > 0 and len(prior) > body.maxHistoryMessages:
+                prior = prior[-body.maxHistoryMessages:]
+
+            messages: list[dict] = []
+            if body.systemPrompt:
+                messages.append({"role": "system", "content": body.systemPrompt})
+            for m in prior:
+                messages.append({"role": m["role"], "content": m["content"]})
+            messages.append({"role": "user", "content": body.message})
+
+            timeout_s = float(settings.agent_timeout_seconds)
+            full_text = ""
+            used_conn_id = None
+            used_model = None
+
+            for idx, cand in enumerate(candidates):
+                yield _sse("failover_attempt", {
+                    "candidateIndex": idx,
+                    "connectionId": cand["connectionId"],
+                    "modelId": cand["modelId"],
+                    "connectionName": cand["displayName"],
+                    "message": f"Trying {cand['displayName']} · {cand['modelId']}",
+                })
+
+                secret, _ = CredentialRepo.select_secret(conn, cand["connectionId"])
+                if not secret:
+                    yield _sse("failover_skip", {
+                        "candidateIndex": idx,
+                        "category": "auth_failed",
+                        "message": "No enabled API key for this connection.",
+                    })
+                    continue
+
+                try:
+                    adapter = resolve_adapter(cand["adapter"])
+                except ValueError:
+                    yield _sse("failover_skip", {
+                        "candidateIndex": idx,
+                        "category": "invalid_endpoint",
+                        "message": "Unknown adapter.",
+                    })
+                    continue
+
+                t0 = time.time()
+                try:
+                    accumulated = ""
+                    for chunk in adapter.chat_stream(
+                        cand["baseUrl"], secret, cand["modelId"], messages,
+                        timeout=timeout_s,
+                    ):
+                        if chunk.delta:
+                            accumulated += chunk.delta
+                            yield _sse("delta", {"text": chunk.delta})
+
+                    full_text = accumulated
+                    used_conn_id = cand["connectionId"]
+                    used_model = cand["modelId"]
+                    duration_ms = int((time.time() - t0) * 1000)
+
+                    yield _sse("failover_success", {
+                        "candidateIndex": idx,
+                        "connectionId": cand["connectionId"],
+                        "modelId": cand["modelId"],
+                        "durationMs": duration_ms,
+                    })
+
+                    DiagnosticsRepo.log(conn, DiagnosticEvent(
+                        event_type="failover_stream_success",
+                        connection_id=cand["connectionId"],
+                        provider_id=cand["adapter"],
+                        model=cand["modelId"],
+                        status="ok",
+                        duration_ms=duration_ms,
+                        message=f"Succeeded on candidate {idx + 1}",
+                        details={"profile_id": body.profileId, "candidate_index": idx},
+                    ))
+                    break
+
+                except AdapterError as exc:
+                    duration_ms = int((time.time() - t0) * 1000)
+                    yield _sse("failover_skip", {
+                        "candidateIndex": idx,
+                        "category": exc.category,
+                        "message": exc.message,
+                        "durationMs": duration_ms,
+                    })
+                    DiagnosticsRepo.log(conn, DiagnosticEvent(
+                        event_type="failover_stream_candidate_failed",
+                        connection_id=cand["connectionId"],
+                        provider_id=cand["adapter"],
+                        model=cand["modelId"],
+                        status="error",
+                        duration_ms=duration_ms,
+                        message=exc.message,
+                        details={"profile_id": body.profileId, "candidate_index": idx, "category": exc.category},
+                    ))
+                    if not _is_retryable(exc.category):
+                        yield _sse("error", {"code": exc.category, "message": exc.message})
+                        return
+                    continue
+                except Exception as exc:
+                    duration_ms = int((time.time() - t0) * 1000)
+                    yield _sse("failover_skip", {
+                        "candidateIndex": idx,
+                        "category": "network_error",
+                        "message": str(exc)[:200],
+                        "durationMs": duration_ms,
+                    })
+                    continue
+            else:
+                yield _sse("error", {"code": "failover_exhausted", "message": "All fallback candidates failed."})
+                return
+
+            if not full_text:
+                full_text = "(No response generated.)"
+
+            try:
+                assistant_msg = MessageRepo.append(
+                    conn, conversation_id=body.conversationId, role="assistant", content=full_text,
+                )
+            except Exception:
+                yield _sse("error", {"code": "database_error", "message": "Response generated but could not be saved."})
+                return
+
+            yield _sse("done", {
+                "assistantMessage": assistant_msg,
+                "meta": {
+                    "connectionId": used_conn_id,
+                    "model": used_model,
+                    "profileId": body.profileId,
+                    "requestId": request_id,
+                },
+                "toolsExecuted": None,
             })
 
     return StreamingResponse(
