@@ -300,7 +300,7 @@ class OpenAICompatibleAdapter:
         try:
             r = httpx.post(
                 self._chat_url(url),
-                headers=self._headers(api_key, _openrouter_headers(base_url)),
+                headers=self._headers(api_key, extra=_openrouter_headers(base_url)),
                 json={
                     "model": model,
                     "messages": [{"role": "user", "content": "ping"}],
@@ -332,7 +332,7 @@ class OpenAICompatibleAdapter:
         try:
             r = httpx.post(
                 self._chat_url(url),
-                headers=self._headers(api_key, _openrouter_headers(base_url)),
+                headers=self._headers(api_key, extra=_openrouter_headers(base_url)),
                 json=body_payload,
                 **safe_request_kwargs(timeout=timeout),
             )
@@ -383,7 +383,7 @@ class OpenAICompatibleAdapter:
             with httpx.stream(
                 "POST",
                 self._chat_url(url),
-                headers=self._headers(api_key, _openrouter_headers(base_url)),
+                headers=self._headers(api_key, extra=_openrouter_headers(base_url)),
                 json=body_payload,
                 **safe_request_kwargs(timeout=timeout),
             ) as r:
@@ -466,7 +466,7 @@ class OpenAICompatibleAdapter:
                 raise
             raise AdapterError(CATEGORY_NETWORK_ERROR, "Network error during streaming.") from exc
 
-    def _headers(self, api_key: str, *, extra: Optional[dict] = None) -> dict:
+    def _headers(self, api_key: str, extra: Optional[dict] = None) -> dict:
         h = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",

@@ -49,6 +49,62 @@ def create_profile(body: ProfileCreate):
         return ProfileRepo.create(conn, name=body.name, description=body.description)
 
 
+# --- Default profile (must be defined BEFORE /{pid} to avoid path shadowing) ---
+
+class DefaultProfileBody(BaseModel):
+    profileId: Optional[str] = None
+
+
+@router.get("/default")
+def get_default_profile():
+    with connect() as conn:
+        pid = DefaultProfileRepo.get(conn)
+        if not pid:
+            return {"profileId": None}
+        p = ProfileRepo.get(conn, pid)
+        if not p:
+            return {"profileId": None}
+        return {"profileId": pid, "profile": p}
+
+
+@router.put("/default")
+def set_default_profile(body: DefaultProfileBody):
+    with connect() as conn:
+        if body.profileId:
+            if not ProfileRepo.get(conn, body.profileId):
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Profile not found")
+        pid = DefaultProfileRepo.set(conn, body.profileId)
+        return {"profileId": pid}
+
+
+# --- Project assignment (must be defined BEFORE /{pid} to avoid path shadowing) ---
+
+class ProjectAssignmentBody(BaseModel):
+    profileId: str = Field(min_length=1, max_length=120)
+
+
+@router.get("/project/{project_id}")
+def get_project_assignment(project_id: str):
+    with connect() as conn:
+        return ProjectProfileAssignmentRepo.get(conn, project_id)
+
+
+@router.put("/project/{project_id}")
+def set_project_assignment(project_id: str, body: ProjectAssignmentBody):
+    with connect() as conn:
+        if not ProfileRepo.get(conn, body.profileId):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Profile not found")
+        return ProjectProfileAssignmentRepo.set(conn, project_id, body.profileId)
+
+
+@router.delete("/project/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+def clear_project_assignment(project_id: str):
+    with connect() as conn:
+        ProjectProfileAssignmentRepo.clear(conn, project_id)
+
+
+# --- Profile by id (dynamic path — must come AFTER all static sub-paths) ---
+
 @router.get("/{pid}")
 def get_profile(pid: str):
     with connect() as conn:
@@ -154,57 +210,3 @@ def get_resolved_candidates(pid: str):
         if not ProfileRepo.get(conn, pid):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Profile not found")
         return resolve_candidates(conn, pid)
-
-
-# --- Default profile ---
-
-class DefaultProfileBody(BaseModel):
-    profileId: Optional[str] = None
-
-
-@router.get("/default")
-def get_default_profile():
-    with connect() as conn:
-        pid = DefaultProfileRepo.get(conn)
-        if not pid:
-            return {"profileId": None}
-        p = ProfileRepo.get(conn, pid)
-        if not p:
-            return {"profileId": None}
-        return {"profileId": pid, "profile": p}
-
-
-@router.put("/default")
-def set_default_profile(body: DefaultProfileBody):
-    with connect() as conn:
-        if body.profileId:
-            if not ProfileRepo.get(conn, body.profileId):
-                raise HTTPException(status.HTTP_404_NOT_FOUND, "Profile not found")
-        pid = DefaultProfileRepo.set(conn, body.profileId)
-        return {"profileId": pid}
-
-
-# --- Project assignment ---
-
-class ProjectAssignmentBody(BaseModel):
-    profileId: str = Field(min_length=1, max_length=120)
-
-
-@router.get("/project/{project_id}")
-def get_project_assignment(project_id: str):
-    with connect() as conn:
-        return ProjectProfileAssignmentRepo.get(conn, project_id)
-
-
-@router.put("/project/{project_id}")
-def set_project_assignment(project_id: str, body: ProjectAssignmentBody):
-    with connect() as conn:
-        if not ProfileRepo.get(conn, body.profileId):
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Profile not found")
-        return ProjectProfileAssignmentRepo.set(conn, project_id, body.profileId)
-
-
-@router.delete("/project/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
-def clear_project_assignment(project_id: str):
-    with connect() as conn:
-        ProjectProfileAssignmentRepo.clear(conn, project_id)
