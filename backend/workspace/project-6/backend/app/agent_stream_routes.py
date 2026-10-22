@@ -1,0 +1,781 @@
+"""Streaming agent execution route (SSE).
+
+Exposes POST /agent/run/stream. The route streams text deltas, tool execution
+events, and file-change events to the frontend as they happen, so the UI can
+show progressive output instead of waiting for the full response.
+
+Event protocol (Server-Sent Events):
+  event: start         data: {requestId, conversationId, userMessage}
+  event: delta         data: {text}
+  event: tool_start    data: {name, args}
+  event: tool_result   data: {name, result}
+  event: file_change   data: {path, action}   # action: created|modified|deleted|renamed
+  event: activity      data: {status, message, fileName?}
+  event: done          data: {assistantMessage, meta, toolsExecuted?}
+  event: error         data: {code, message}
+
+All operations reuse the same validation, security, and persistence patterns
+as the non-streaming /agent/run endpoint. The user message is persisted first;
+the assistant message is persisted only once at the end.
+"""
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from typing import Any, Optional
+
+from fastapi import APIRouter, Header, status
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from app.config import settings
+from app.logging_config import log_backend, log_provider, log_error, log_agent, log_tool, is_debug_enabled
+from app.db import connect
+from app.repositories import ConversationRepo, MessageRepo
+from app.connection_repos import ConnectionRepo, CredentialRepo, AgentDefaultsRepo
+from app.adapters import resolve_adapter, AdapterError, StreamChunk
+from app.diagnostics import DiagnosticsRepo, DiagnosticEvent
+from app.crypto import is_encryption_available
+from app.retrieval import retrieve_context, render_context_block, DEFAULT_RETRIEVAL_BUDGET_CHARS
+from app.agent_file_tools import (
+    retrieve_project_context,
+    render_project_context_block,
+    DEFAULT_PROJECT_CONTEXT_BUDGET_CHARS,
+    resolve_project_root,
+    GEMINI_TOOL_DECLARATIONS,
+    execute_tool_call,
+    build_tool_instruction,
+)
+from app.agent_routes import (
+    AgentRunRequest,
+    ProfileRunRequest,
+    _resolve_connection,
+    _safe_usage,
+    _build_runtime_system_block,
+    _simulated_response,
+    _log_request_start,
+    _log_request_success,
+    _log_request_failure,
+    _NON_RETRYABLE,
+    _MAX_RETRIES,
+)
+
+import json as _json
+
+router = APIRouter(prefix="/agent", tags=["agent-stream"])
+logger = logging.getLogger("app.agent_stream")
+
+MAX_TOOL_ROUNDS = 20
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _build_messages(
+    body: AgentRunRequest,
+    conn,
+    user_msg: dict,
+) -> tuple[list[dict], Optional[dict], str, bool, list, str, int, list, int, Optional[dict]]:
+    """Build the message list, mirroring the non-streaming route logic.
+    Returns (messages, connection, model, model_substituted, retrieved,
+    retrieval_block, retrieval_len, project_items, project_len, error_detail).
+    error_detail is set if a pre-execution error occurred (dict with code+message).
+    """
+    connection = _resolve_connection(conn, body.connectionId)
+    if not connection or not connection["enabled"]:
+        if body.allowSimulation:
+            # Simulation path handled by caller separately.
+            return [], None, "", False, [], "", 0, [], 0, None
+        return [], None, "", False, [], "", 0, [], 0, {
+            "code": "provider_not_configured",
+            "message": "No AI connection is configured. Open Settings to add one, or enable simulation.",
+        }
+
+    if not is_encryption_available():
+        return [], connection, "", False, [], "", 0, [], 0, {
+            "code": "provider_unavailable",
+            "message": "Credential storage is not configured. Set PAIDE_ENC_KEY on the backend.",
+        }
+
+    selected_model = (body.model or "").strip()
+    model_substituted = False
+    if selected_model:
+        model = selected_model
+    elif connection["defaultModel"]:
+        model = connection["defaultModel"]
+        model_substituted = True
+    else:
+        return [], connection, "", False, [], "", 0, [], 0, {
+            "code": "invalid_request",
+            "message": "No model selected. Add a model to the connection in Settings.",
+        }
+
+    history = MessageRepo.list(conn, body.conversationId)
+    prior = [m for m in history if m["id"] != user_msg["id"]]
+    if body.maxHistoryMessages > 0 and len(prior) > body.maxHistoryMessages:
+        prior = prior[-body.maxHistoryMessages:]
+
+    retrieved = []
+    retrieval_block = ""
+    try:
+        retrieved = retrieve_context(conn, message=body.message, project_id=body.projectId, budget_chars=body.maxRetrievalChars)
+        retrieval_block = render_context_block(retrieved)
+    except Exception:
+        retrieved = []
+        retrieval_block = ""
+
+    project_items = []
+    project_block = ""
+    try:
+        project_items = retrieve_project_context(body.projectId, body.message, body.maxProjectContextChars)
+        project_block = render_project_context_block(project_items)
+    except Exception:
+        project_items = []
+        project_block = ""
+
+    retrieval_len = len(retrieval_block)
+    project_len = len(project_block)
+    if body.maxContextChars > 0:
+        kept = []
+        used = retrieval_len + project_len
+        for m in reversed(prior):
+            cost = len(m["content"]) + 1
+            if used + cost > body.maxContextChars:
+                break
+            kept.insert(0, m)
+            used += cost
+        prior = kept
+
+    messages: list[dict] = []
+    if body.systemPrompt:
+        messages.append({"role": "system", "content": body.systemPrompt})
+    runtime_block = _build_runtime_system_block(
+        selected_model=selected_model, resolved_model=model,
+        model_substituted=model_substituted, adapter_id=connection["adapter"],
+    )
+    messages.append({"role": "system", "content": runtime_block})
+    if retrieval_block:
+        messages.append({"role": "system", "content": retrieval_block})
+    if project_block:
+        messages.append({"role": "system", "content": project_block})
+    for m in prior:
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": body.message})
+
+    return (messages, connection, model, model_substituted, retrieved,
+            retrieval_block, retrieval_len, project_items, project_len, None)
+
+
+def _detect_file_changes(tool_name: str, tool_args: dict, tool_result: dict) -> Optional[dict]:
+    """Map a tool execution to a file_change event."""
+    if "error" in tool_result:
+        return None
+    if tool_name == "write_file":
+        path = tool_result.get("path") or tool_args.get("path", "")
+        created = tool_result.get("created", False)
+        return {"path": path, "action": "created" if created else "modified"}
+    if tool_name == "create_directory":
+        return {"path": tool_result.get("path", ""), "action": "created"}
+    if tool_name == "delete_path":
+        return {"path": tool_result.get("path", ""), "action": "deleted"}
+    if tool_name == "rename_path":
+        return {"path": tool_result.get("toPath", ""), "action": "renamed",
+                "oldPath": tool_result.get("fromPath", "")}
+    if tool_name == "create_project":
+        files = tool_result.get("fileList", [])
+        ws_path = tool_result.get("workspacePath", "")
+        project_id = tool_result.get("projectId", "")
+        cli_used = tool_result.get("cliUsed", False)
+        if files:
+            return {"path": files[0], "action": "created",
+                    "projectCreated": True,
+                    "workspacePath": ws_path,
+                    "projectId": project_id,
+                    "files": files,
+                    "cliUsed": cli_used}
+        if ws_path:
+            return {"path": ws_path, "action": "created",
+                    "projectCreated": True,
+                    "workspacePath": ws_path,
+                    "projectId": project_id,
+                    "files": [],
+                    "cliUsed": cli_used}
+        return None
+    return None
+
+
+def _activity_for_tool(tool_name: str) -> str:
+    mapping = {
+        "list_files": "Exploring project",
+        "read_file": "Reading file",
+        "write_file": "Writing file",
+        "create_directory": "Creating directory",
+        "search_files": "Searching project",
+        "rename_path": "Renaming file",
+        "delete_path": "Deleting file",
+        "run_command": "Running command",
+        "detect_runtime": "Detecting runtime",
+        "install_deps": "Installing dependencies",
+        "create_project": "Creating project",
+        "get_env_template": "Reading env template",
+    }
+    return mapping.get(tool_name, "Executing tool")
+
+
+@router.post("/run/stream")
+async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id")):
+    started = int(time.time() * 1000)
+    request_id = (x_request_id or "").strip() or str(uuid.uuid4())
+    log_backend("Backend received streaming AI request", request_id=request_id, conversation_id=body.conversationId)
+
+    def generate():
+        with connect() as conn:
+            conv = ConversationRepo.get(conn, body.conversationId)
+            if not conv:
+                yield _sse("error", {"code": "not_found", "message": "Conversation not found"})
+                return
+
+            try:
+                user_msg = MessageRepo.append(
+                    conn, conversation_id=body.conversationId, role="user", content=body.message,
+                )
+            except Exception as exc:
+                log_error("Streaming DB error — failed to persist user message", exc=exc, request_id=request_id)
+                yield _sse("error", {"code": "database_error", "message": "Failed to save your message. Please try again."})
+                return
+            yield _sse("start", {"requestId": request_id, "conversationId": body.conversationId, "userMessage": user_msg})
+
+            messages, connection, model, model_substituted, retrieved, \
+                retrieval_block, retrieval_len, project_items, project_len, pre_error = \
+                _build_messages(body, conn, user_msg)
+
+            if pre_error:
+                yield _sse("error", pre_error)
+                return
+
+            if connection is None:
+                # Simulation mode
+                content = _simulated_response(body.message)
+                yield _sse("activity", {"status": "simulating", "message": "Generating simulated response"})
+                assistant_msg = MessageRepo.append(
+                    conn, conversation_id=body.conversationId, role="assistant", content=content,
+                )
+                yield _sse("done", {
+                    "assistantMessage": assistant_msg,
+                    "meta": {"providerId": "dev", "model": body.model or "dev-simulated", "simulated": True, "finishReason": "stop"},
+                    "toolsExecuted": None,
+                })
+                return
+
+            try:
+                adapter = resolve_adapter(connection["adapter"])
+            except ValueError:
+                yield _sse("error", {"code": "provider_unavailable", "message": "Unknown adapter for this connection."})
+                return
+
+            secret, cred = CredentialRepo.select_secret(conn, connection["id"])
+            if not secret:
+                yield _sse("error", {"code": "provider_not_ready", "message": "No enabled API key for this connection."})
+                return
+
+            _log_request_start(
+                request_id, selected_connection_id=body.connectionId, selected_model=(body.model or ""),
+                resolved_connection_id=connection["id"], adapter_id=connection["adapter"],
+                resolved_model=model, cred_id=cred["id"] if cred else None,
+            )
+
+            timeout_s = float(settings.agent_timeout_seconds)
+            project_root = None
+            if body.projectId:
+                project_root = resolve_project_root(body.projectId)
+            # Always send tools to the model. When no project is open, only
+            # create_project and get_env_template will succeed; the others
+            # return a helpful error. This lets the agent scaffold new
+            # projects from an empty workspace.
+            tools_for_adapter = GEMINI_TOOL_DECLARATIONS
+            tool_instr_idx = len(messages)
+            messages.append({"role": "system", "content": build_tool_instruction(project_root is not None)})
+
+            log_agent("Streaming agent loop starting",
+                      request_id=request_id,
+                      adapter=connection["adapter"],
+                      model=model,
+                      project_root=str(project_root) if project_root else "(none)",
+                      tools_count=len(tools_for_adapter),
+                      tool_names=[t.get("name", "?") for t in tools_for_adapter],
+                      max_rounds=MAX_TOOL_ROUNDS,
+                      timeout_s=timeout_s)
+            log_agent("Tools declared to model — run_command present",
+                      request_id=request_id,
+                      has_run_command=any(t.get("name") == "run_command" for t in tools_for_adapter),
+                      level=logging.DEBUG if is_debug_enabled() else logging.INFO)
+
+            yield _sse("activity", {"status": "thinking", "message": "AI is analyzing your request"})
+
+            tools_executed: list[dict] = []
+            full_text = ""
+            provider_model: Optional[str] = None
+            finish_reason: Optional[str] = None
+            usage: Optional[dict] = None
+            seen_tool_calls: set[tuple[str, str]] = set()
+
+            current_messages = list(messages)
+            req_t0 = time.time()
+
+            for round_idx in range(MAX_TOOL_ROUNDS + 1):
+                log_agent("Stream round starting",
+                          request_id=request_id,
+                          round_idx=round_idx,
+                          message_count=len(current_messages),
+                          level=logging.DEBUG if is_debug_enabled() else logging.INFO)
+                try:
+                    accumulated_text = ""
+                    accumulated_tool_calls: list = []
+                    round_finish = None
+                    round_usage = None
+                    log_agent("Stream round — sending to provider",
+                              request_id=request_id,
+                              round_idx=round_idx,
+                              model=model,
+                              message_count=len(current_messages),
+                              message_roles=[m.get("role", "?") for m in current_messages],
+                              message_has_tool_calls=sum(1 for m in current_messages if m.get("tool_calls")),
+                              message_has_tool_result=sum(1 for m in current_messages if m.get("tool_result")),
+                              last_message_role=current_messages[-1].get("role", "?") if current_messages else "(none)",
+                              last_message_has_tool_result=bool(current_messages[-1].get("tool_result")) if current_messages else False,
+                              tools_count=len(tools_for_adapter),
+                              level=logging.DEBUG if is_debug_enabled() else logging.INFO)
+                    for chunk in adapter.chat_stream(
+                        connection["baseUrl"], secret, model, current_messages,
+                        timeout=timeout_s, tools=tools_for_adapter,
+                    ):
+                        if chunk.delta:
+                            accumulated_text += chunk.delta
+                            yield _sse("delta", {"text": chunk.delta})
+                        if chunk.tool_calls:
+                            accumulated_tool_calls.extend(chunk.tool_calls)
+                        if chunk.finish_reason:
+                            round_finish = chunk.finish_reason
+                        if chunk.usage:
+                            round_usage = chunk.usage
+                    finish_reason = round_finish or finish_reason
+                    usage = round_usage or usage
+                except AdapterError as exc:
+                    req_dur = int((time.time() - req_t0) * 1000)
+                    _log_request_failure(request_id, resolved_model=model, error_code=exc.category,
+                                         error_msg=str(exc), status_code=exc.status_code, duration_ms=req_dur)
+                    log_agent("Stream adapter error — aborting",
+                              request_id=request_id,
+                              round_idx=round_idx,
+                              error_code=exc.category,
+                              error_msg=str(exc)[:200],
+                              level=logging.ERROR)
+                    log_agent("Stream adapter error — message structure diagnostics",
+                              request_id=request_id,
+                              round_idx=round_idx,
+                              model=model,
+                              message_count=len(current_messages),
+                              message_roles=[m.get("role", "?") for m in current_messages],
+                              message_has_tool_calls=sum(1 for m in current_messages if m.get("tool_calls")),
+                              message_has_tool_result=sum(1 for m in current_messages if m.get("tool_result")),
+                              last_message_role=current_messages[-1].get("role", "?") if current_messages else "(none)",
+                              last_message_has_tool_result=bool(current_messages[-1].get("tool_result")) if current_messages else False,
+                              tools_executed_this_round=len(accumulated_tool_calls),
+                              tools_executed_names=[tc.name for tc in accumulated_tool_calls] if accumulated_tool_calls else [],
+                              level=logging.ERROR)
+                    yield _sse("error", {"code": exc.category, "message": str(exc)})
+                    return
+                except Exception as exc:
+                    req_dur = int((time.time() - req_t0) * 1000)
+                    _log_request_failure(request_id, resolved_model=model, error_code="provider_failed",
+                                         error_msg="The provider request failed unexpectedly.", status_code=None, duration_ms=req_dur)
+                    log_error("Streaming provider exception", exc=exc, request_id=request_id)
+                    log_agent("Stream unexpected exception — aborting",
+                              request_id=request_id,
+                              round_idx=round_idx,
+                              error_type=type(exc).__name__,
+                              error_msg=str(exc)[:200],
+                              level=logging.ERROR)
+                    yield _sse("error", {"code": "provider_failed", "message": "The provider request failed unexpectedly."})
+                    return
+
+                full_text += accumulated_text
+                log_agent("Stream round completed — model response received",
+                          request_id=request_id,
+                          round_idx=round_idx,
+                          has_text=bool(accumulated_text),
+                          text_len=len(accumulated_text),
+                          tool_call_count=len(accumulated_tool_calls),
+                          finish_reason=round_finish or "(none)",
+                          level=logging.DEBUG if is_debug_enabled() else logging.INFO)
+
+                # If no tool calls, we're done. Tool execution is allowed
+                # even without a project root (create_project, get_env_template).
+                if not accumulated_tool_calls:
+                    log_agent("No tool calls in this round — ending loop",
+                              request_id=request_id,
+                              round_idx=round_idx)
+                    break
+
+                # Execute tools and feed results back.
+                # Collect all tool calls and results for this round, then append
+                # them as a single assistant (model) turn with all functionCalls
+                # and a single user turn with all functionResponses. Gemini
+                # requires this pairing — separate turns per tool call cause
+                # HTTP 400 errors in subsequent rounds.
+                round_tool_calls: list[dict] = []
+                round_tool_results: list[dict] = []
+
+                for tc in accumulated_tool_calls:
+                    call_key = (tc.name, _json.dumps(tc.args, sort_keys=True))
+                    if call_key in seen_tool_calls:
+                        log_agent("Tool call skipped (duplicate)",
+                                  request_id=request_id,
+                                  tool=tc.name,
+                                  level=logging.WARNING)
+                        continue
+                    seen_tool_calls.add(call_key)
+                    log_agent("Tool call received from model — dispatching",
+                              request_id=request_id,
+                              round_idx=round_idx,
+                              tool=tc.name,
+                              args_keys=list(tc.args.keys()) if isinstance(tc.args, dict) else [])
+                    yield _sse("tool_start", {"name": tc.name, "args": tc.args})
+                    yield _sse("activity", {"status": "tool", "message": _activity_for_tool(tc.name),
+                                            "fileName": tc.args.get("path") if isinstance(tc.args, dict) else None})
+                    tool_result = execute_tool_call(project_root, tc.name, tc.args)
+                    tools_executed.append({"name": tc.name, "args": tc.args, "result": tool_result})
+                    log_agent("Tool execution result",
+                              request_id=request_id,
+                              round_idx=round_idx,
+                              tool=tc.name,
+                              success="error" not in tool_result,
+                              error=tool_result.get("error", "")[:200] if "error" in tool_result else "(none)",
+                              exit_code=tool_result.get("exitCode", "(n/a)"),
+                              level=logging.DEBUG if is_debug_enabled() else logging.INFO)
+                    yield _sse("tool_result", {"name": tc.name, "result": tool_result})
+
+                    fc = _detect_file_changes(tc.name, tc.args, tool_result)
+                    if fc:
+                        if fc.get("projectCreated"):
+                            yield _sse("project_created", {
+                                "projectId": fc.get("projectId", ""),
+                                "workspacePath": fc.get("workspacePath", ""),
+                                "files": fc.get("files", []),
+                            })
+                            yield _sse("activity", {"status": "saved", "message": f"Created project: {fc.get('workspacePath', '')}",
+                                                    "fileName": fc.get("workspacePath", "")})
+                            if fc.get("projectId"):
+                                new_root = resolve_project_root(fc["projectId"])
+                                if new_root:
+                                    project_root = new_root
+                                    messages[tool_instr_idx] = {
+                                        "role": "system",
+                                        "content": build_tool_instruction(True),
+                                    }
+                                    current_messages = list(messages)
+                                    current_messages.append({
+                                        "role": "system",
+                                        "content": (
+                                            "A project has been created and is now the active project. "
+                                            "You now have full access to file tools (list_files, read_file, write_file, etc.), "
+                                            "run_command for terminal/shell commands, detect_runtime, and install_deps. "
+                                            f"The project root is: {fc.get('workspacePath', '')}. "
+                                            "Continue with the next steps: list files to verify structure, install dependencies, run commands, or write additional files as needed. "
+                                            "Do NOT stop after creating the project — complete all requested work."
+                                        ),
+                                    })
+                        else:
+                            yield _sse("file_change", fc)
+                            yield _sse("activity", {"status": "saved", "message": f"{'Created' if fc['action'] == 'created' else 'Saved'} {fc['path']}",
+                                                    "fileName": fc["path"]})
+
+                    tc_entry: dict = {"name": tc.name, "args": tc.args}
+                    if getattr(tc, "thought_signature", None):
+                        tc_entry["thought_signature"] = tc.thought_signature
+                    round_tool_calls.append(tc_entry)
+                    round_tool_results.append({"name": tc.name, "result": tool_result})
+
+                # Append all functionCalls as one model turn and all
+                # functionResponses as one user turn — Gemini requires this
+                # structure for multi-tool rounds.
+                if round_tool_calls:
+                    current_messages.append({
+                        "role": "assistant", "content": "",
+                        "tool_calls": round_tool_calls,
+                    })
+                for tr in round_tool_results:
+                    current_messages.append({
+                        "role": "user", "content": "",
+                        "tool_result": tr,
+                    })
+
+                yield _sse("activity", {"status": "continuing", "message": "AI is continuing after tool execution"})
+                log_agent("Continuing to next round after tool execution",
+                          request_id=request_id,
+                          round_idx=round_idx,
+                          tools_executed_count=len(tools_executed),
+                          level=logging.DEBUG if is_debug_enabled() else logging.INFO)
+
+            req_dur = int((time.time() - req_t0) * 1000)
+            log_agent("Streaming agent loop ended",
+                      request_id=request_id,
+                      total_rounds=round_idx + 1,
+                      total_tools_executed=len(tools_executed),
+                      full_text_len=len(full_text),
+                      finish_reason=finish_reason or "(none)",
+                      duration_ms=req_dur)
+
+            # If we hit the round limit with tools still running, report it.
+            round_limit_hit = accumulated_tool_calls and round_idx >= MAX_TOOL_ROUNDS
+
+            # If tools ran but no final text, build a summary.
+            if not full_text and tools_executed:
+                summary_parts = [f"I executed {len(tools_executed)} tool operation(s):"]
+                for t in tools_executed:
+                    status_txt = "ok" if "error" not in t["result"] else "failed"
+                    summary_parts.append(f"- {t['name']}: {status_txt}")
+                if round_limit_hit:
+                    summary_parts.append("")
+                    summary_parts.append(f"NOTE: Reached the maximum of {MAX_TOOL_ROUNDS} tool rounds. The task may not be fully complete.")
+                full_text = "\n".join(summary_parts)
+
+            if not full_text and not tools_executed:
+                full_text = "(No response generated.)"
+
+            # Persist the assistant message once.
+            try:
+                assistant_msg = MessageRepo.append(
+                    conn, conversation_id=body.conversationId, role="assistant", content=full_text,
+                )
+                ConnectionRepo.update(conn, connection["id"], status="connected")
+            except Exception as exc:
+                log_error("Streaming DB error — failed to persist assistant message", exc=exc, request_id=request_id)
+                yield _sse("error", {"code": "database_error", "message": "The response was generated but could not be saved. Please try again."})
+                return
+
+            safe_usage = _safe_usage(usage)
+            _log_request_success(request_id, resolved_model=model, provider_model=provider_model,
+                                 response_id=None, status_code=200, duration_ms=req_dur,
+                                 usage=safe_usage, fallback=model_substituted)
+
+            yield _sse("activity", {"status": "completed", "message": "Response complete"})
+            yield _sse("done", {
+                "assistantMessage": assistant_msg,
+                "meta": {
+                    "providerId": connection["adapter"],
+                    "connectionId": connection["id"],
+                    "model": model,
+                    "simulated": False,
+                    "finishReason": finish_reason,
+                    "usage": safe_usage,
+                    "requestId": request_id,
+                    "selectedModel": (body.model or "") or None,
+                    "modelSubstituted": model_substituted,
+                },
+                "toolsExecuted": tools_executed if tools_executed else None,
+            })
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/run/profile/stream")
+async def stream_agent_with_profile(body: ProfileRunRequest, x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id")):
+    """Stream agent output using a model profile's fallback chain.
+
+    Tries each candidate in priority order. Emits failover events when a
+    candidate fails so the UI can show which models were tried.
+    """
+    from app.profile_repos import ProfileRepo, resolve_candidates
+    from app.failover import _is_retryable
+
+    started = int(time.time() * 1000)
+    request_id = (x_request_id or "").strip() or str(uuid.uuid4())
+
+    def generate():
+        with connect() as conn:
+            conv = ConversationRepo.get(conn, body.conversationId)
+            if not conv:
+                yield _sse("error", {"code": "not_found", "message": "Conversation not found"})
+                return
+
+            prof = ProfileRepo.get(conn, body.profileId)
+            if not prof:
+                yield _sse("error", {"code": "not_found", "message": "Profile not found"})
+                return
+            if not prof["enabled"]:
+                yield _sse("error", {"code": "bad_request", "message": "Profile is disabled"})
+                return
+
+            try:
+                user_msg = MessageRepo.append(
+                    conn, conversation_id=body.conversationId, role="user", content=body.message,
+                )
+            except Exception:
+                yield _sse("error", {"code": "database_error", "message": "Failed to save your message."})
+                return
+
+            yield _sse("start", {"requestId": request_id, "conversationId": body.conversationId, "userMessage": user_msg})
+
+            candidates = resolve_candidates(conn, body.profileId)
+            if not candidates:
+                yield _sse("error", {"code": "no_candidates", "message": "No usable candidates in this profile."})
+                return
+
+            # Build context (simplified — no tool support in profile mode yet).
+            history = MessageRepo.list(conn, body.conversationId)
+            prior = [m for m in history if m["id"] != user_msg["id"]]
+            if body.maxHistoryMessages > 0 and len(prior) > body.maxHistoryMessages:
+                prior = prior[-body.maxHistoryMessages:]
+
+            messages: list[dict] = []
+            if body.systemPrompt:
+                messages.append({"role": "system", "content": body.systemPrompt})
+            for m in prior:
+                messages.append({"role": m["role"], "content": m["content"]})
+            messages.append({"role": "user", "content": body.message})
+
+            timeout_s = float(settings.agent_timeout_seconds)
+            full_text = ""
+            used_conn_id = None
+            used_model = None
+
+            for idx, cand in enumerate(candidates):
+                yield _sse("failover_attempt", {
+                    "candidateIndex": idx,
+                    "connectionId": cand["connectionId"],
+                    "modelId": cand["modelId"],
+                    "connectionName": cand["displayName"],
+                    "message": f"Trying {cand['displayName']} · {cand['modelId']}",
+                })
+
+                secret, _ = CredentialRepo.select_secret(conn, cand["connectionId"])
+                if not secret:
+                    yield _sse("failover_skip", {
+                        "candidateIndex": idx,
+                        "category": "auth_failed",
+                        "message": "No enabled API key for this connection.",
+                    })
+                    continue
+
+                try:
+                    adapter = resolve_adapter(cand["adapter"])
+                except ValueError:
+                    yield _sse("failover_skip", {
+                        "candidateIndex": idx,
+                        "category": "invalid_endpoint",
+                        "message": "Unknown adapter.",
+                    })
+                    continue
+
+                t0 = time.time()
+                try:
+                    accumulated = ""
+                    for chunk in adapter.chat_stream(
+                        cand["baseUrl"], secret, cand["modelId"], messages,
+                        timeout=timeout_s,
+                    ):
+                        if chunk.delta:
+                            accumulated += chunk.delta
+                            yield _sse("delta", {"text": chunk.delta})
+
+                    full_text = accumulated
+                    used_conn_id = cand["connectionId"]
+                    used_model = cand["modelId"]
+                    duration_ms = int((time.time() - t0) * 1000)
+
+                    yield _sse("failover_success", {
+                        "candidateIndex": idx,
+                        "connectionId": cand["connectionId"],
+                        "modelId": cand["modelId"],
+                        "durationMs": duration_ms,
+                    })
+
+                    DiagnosticsRepo.log(conn, DiagnosticEvent(
+                        event_type="failover_stream_success",
+                        connection_id=cand["connectionId"],
+                        provider_id=cand["adapter"],
+                        model=cand["modelId"],
+                        status="ok",
+                        duration_ms=duration_ms,
+                        message=f"Succeeded on candidate {idx + 1}",
+                        details={"profile_id": body.profileId, "candidate_index": idx},
+                    ))
+                    break
+
+                except AdapterError as exc:
+                    duration_ms = int((time.time() - t0) * 1000)
+                    yield _sse("failover_skip", {
+                        "candidateIndex": idx,
+                        "category": exc.category,
+                        "message": exc.message,
+                        "durationMs": duration_ms,
+                    })
+                    DiagnosticsRepo.log(conn, DiagnosticEvent(
+                        event_type="failover_stream_candidate_failed",
+                        connection_id=cand["connectionId"],
+                        provider_id=cand["adapter"],
+                        model=cand["modelId"],
+                        status="error",
+                        duration_ms=duration_ms,
+                        message=exc.message,
+                        details={"profile_id": body.profileId, "candidate_index": idx, "category": exc.category},
+                    ))
+                    if not _is_retryable(exc.category):
+                        yield _sse("error", {"code": exc.category, "message": exc.message})
+                        return
+                    continue
+                except Exception as exc:
+                    duration_ms = int((time.time() - t0) * 1000)
+                    yield _sse("failover_skip", {
+                        "candidateIndex": idx,
+                        "category": "network_error",
+                        "message": str(exc)[:200],
+                        "durationMs": duration_ms,
+                    })
+                    continue
+            else:
+                yield _sse("error", {"code": "failover_exhausted", "message": "All fallback candidates failed."})
+                return
+
+            if not full_text:
+                full_text = "(No response generated.)"
+
+            try:
+                assistant_msg = MessageRepo.append(
+                    conn, conversation_id=body.conversationId, role="assistant", content=full_text,
+                )
+            except Exception:
+                yield _sse("error", {"code": "database_error", "message": "Response generated but could not be saved."})
+                return
+
+            yield _sse("done", {
+                "assistantMessage": assistant_msg,
+                "meta": {
+                    "connectionId": used_conn_id,
+                    "model": used_model,
+                    "profileId": body.profileId,
+                    "requestId": request_id,
+                },
+                "toolsExecuted": None,
+            })
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

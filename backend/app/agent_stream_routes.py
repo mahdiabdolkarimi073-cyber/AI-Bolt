@@ -492,11 +492,11 @@ async def stream_agent(body: AgentRunRequest, x_request_id: Optional[str] = Head
                             yield _sse("activity", {"status": "saved", "message": f"{'Created' if fc['action'] == 'created' else 'Saved'} {fc['path']}",
                                                     "fileName": fc["path"]})
 
-                    tc_entry: dict = {"name": tc.name, "args": tc.args}
+                    tc_entry: dict = {"name": tc.name, "args": tc.args, "id": getattr(tc, "id", None) or f"call_{abs(hash(tc.name + _json.dumps(tc.args, sort_keys=True)))}"}
                     if getattr(tc, "thought_signature", None):
                         tc_entry["thought_signature"] = tc.thought_signature
                     round_tool_calls.append(tc_entry)
-                    round_tool_results.append({"name": tc.name, "result": tool_result})
+                    round_tool_results.append({"name": tc.name, "result": tool_result, "tool_call_id": tc_entry["id"]})
 
                 # Append all functionCalls as one model turn and all
                 # functionResponses as one user turn — Gemini requires this

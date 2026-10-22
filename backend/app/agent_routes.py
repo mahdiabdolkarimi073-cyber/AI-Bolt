@@ -849,11 +849,11 @@ def run_agent(body: AgentRunRequest, x_request_id: Optional[str] = Header(defaul
                                 "Do NOT stop after creating the project — complete all requested work."
                             ),
                         })
-                tc_entry: dict = {"name": tc.name, "args": tc.args}
+                tc_entry: dict = {"name": tc.name, "args": tc.args, "id": getattr(tc, "id", None) or f"call_{abs(hash(tc.name + _json.dumps(tc.args, sort_keys=True)))}"}
                 if getattr(tc, "thought_signature", None):
                     tc_entry["thought_signature"] = tc.thought_signature
                 round_tool_calls.append(tc_entry)
-                round_tool_results.append({"name": tc.name, "result": tool_result})
+                round_tool_results.append({"name": tc.name, "result": tool_result, "tool_call_id": tc_entry["id"]})
             if round_tool_calls:
                 current_messages.append({
                     "role": "assistant",

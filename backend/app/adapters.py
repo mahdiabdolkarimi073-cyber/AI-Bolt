@@ -54,13 +54,15 @@ CATEGORY_NOT_CONFIGURED = "not_configured"
 
 class ToolCall:
     """A single function/tool call extracted from a provider response."""
-    def __init__(self, *, name: str, args: dict, thought_signature: Optional[str] = None):
+    def __init__(self, *, name: str, args: dict, thought_signature: Optional[str] = None,
+                 id: Optional[str] = None):
         self.name = name
         self.args = args
         self.thought_signature = thought_signature
+        self.id = id or f"call_{abs(hash(name + _json.dumps(args, sort_keys=True)))}"
 
     def to_dict(self) -> dict:
-        d = {"name": self.name, "args": self.args}
+        d = {"name": self.name, "args": self.args, "id": self.id}
         if self.thought_signature is not None:
             d["thought_signature"] = self.thought_signature
         return d
@@ -326,6 +328,7 @@ class OpenAICompatibleAdapter:
         url = self.validate_config(base_url)
         if not api_key:
             raise AdapterError(CATEGORY_AUTH_FAILED, "No API key available for this connection.")
+        messages = self._normalize_messages_for_openai(messages)
         body_payload: dict = {"model": model, "messages": messages, "temperature": 0.2}
         if tools:
             body_payload["tools"] = [{"type": "function", "function": t} for t in tools]
@@ -376,6 +379,7 @@ class OpenAICompatibleAdapter:
         url = self.validate_config(base_url)
         if not api_key:
             raise AdapterError(CATEGORY_AUTH_FAILED, "No API key available for this connection.")
+        messages = self._normalize_messages_for_openai(messages)
         body_payload: dict = {"model": model, "messages": messages, "temperature": 0.2, "stream": True}
         if tools:
             body_payload["tools"] = [{"type": "function", "function": t} for t in tools]
@@ -452,7 +456,8 @@ class OpenAICompatibleAdapter:
                                             args = {}
                                     elif isinstance(args_raw, dict):
                                         args = args_raw
-                                    tool_calls.append(ToolCall(name=name, args=args))
+                                    tc_id = tc.get("id") or fn.get("id")
+                                    tool_calls.append(ToolCall(name=name, args=args, id=tc_id))
                     finish = first.get("finish_reason")
                     usage = chunk.get("usage") if isinstance(chunk.get("usage"), dict) else None
                     if delta_text or tool_calls or finish:
@@ -465,6 +470,57 @@ class OpenAICompatibleAdapter:
             if isinstance(exc, AdapterError):
                 raise
             raise AdapterError(CATEGORY_NETWORK_ERROR, "Network error during streaming.") from exc
+
+    def _normalize_messages_for_openai(self, messages: list[dict]) -> list[dict]:
+        """Convert internal message format to OpenAI-compatible format.
+
+        Internal messages may contain Gemini-style tool_calls (list of
+        {name, args, thought_signature}) and tool_result ({name, result}).
+        OpenAI-compatible providers (Groq, OpenRouter, etc.) require:
+          - assistant messages with tool_calls as [{id, type:"function",
+            function:{name, arguments}}]
+          - tool result messages with role:"tool" and tool_call_id
+        """
+        normalized: list[dict] = []
+        for m in messages:
+            role = m.get("role")
+            tool_calls = m.get("tool_calls")
+            tool_result = m.get("tool_result")
+
+            if tool_calls and isinstance(tool_calls, list):
+                oai_tcs = []
+                for entry in tool_calls:
+                    if not isinstance(entry, dict):
+                        continue
+                    tc_id = entry.get("id") or f"call_{abs(hash(entry.get('name','') + _json.dumps(entry.get('args',{}), sort_keys=True)))}"
+                    oai_tcs.append({
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": entry.get("name", ""),
+                            "arguments": _json.dumps(entry.get("args", {}), ensure_ascii=False),
+                        },
+                    })
+                nm: dict = {"role": "assistant", "content": m.get("content") or ""}
+                if oai_tcs:
+                    nm["tool_calls"] = oai_tcs
+                normalized.append(nm)
+            elif tool_result and isinstance(tool_result, dict):
+                tr = tool_result
+                result_val = tr.get("result", {})
+                if isinstance(result_val, dict):
+                    content_str = _json.dumps(result_val, ensure_ascii=False)
+                else:
+                    content_str = str(result_val)
+                tc_id = tr.get("tool_call_id") or f"call_{abs(hash(tr.get('name','') + _json.dumps(tr.get('result',{}), sort_keys=True)))}"
+                normalized.append({
+                    "role": "tool",
+                    "content": content_str,
+                    "tool_call_id": tc_id,
+                })
+            else:
+                normalized.append({"role": role, "content": m.get("content", "")})
+        return normalized
 
     def _headers(self, api_key: str, extra: Optional[dict] = None) -> dict:
         h = {
